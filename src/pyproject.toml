@@ -1,0 +1,12 @@
+[project]
+name = "ifa-qc-hl-lite3-patrol"
+version = "0.1.0"
+description = "Mapless Lite3 patrol MVP core and safety setup"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=5.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

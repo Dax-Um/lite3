@@ -40,7 +40,7 @@ class FakeDriver:
         self.closed = True
 
 
-def test_dry_run_is_default_and_builds_two_lane_return_plan():
+def test_dry_run_is_default_and_builds_two_lane_shuttle_plan():
     script = load_script()
     args = script.parse_args([*target_args()])
     script.validate_args(args)
@@ -50,8 +50,7 @@ def test_dry_run_is_default_and_builds_two_lane_return_plan():
     assert args.execute is False
     assert [(segment.name, segment.vx, segment.wz) for segment in plan] == [
         ("lane_1_forward", 0.2, 0.0),
-        ("lane_1_turn", 0.0, 0.2),
-        ("lane_2_forward", 0.2, 0.0),
+        ("lane_2_reverse", -0.2, 0.0),
     ]
 
 
@@ -134,17 +133,14 @@ def test_run_timed_patrol_sends_stops_between_segments_and_final_stop():
         (10, 0.05),
         (10, 0.05),
         (10, 0.05),
-        (10, 0.05),
         (60, 0.05),
     ]
     assert fake.commands == [
         (0.1, 0.0, 0.0),
         (0.1, 0.0, 0.0),
         (0.1, 0.0, 0.0),
-        (0.0, 0.0, 0.1),
-        (0.0, 0.0, 0.1),
-        (0.1, 0.0, 0.0),
-        (0.1, 0.0, 0.0),
-        (0.1, 0.0, 0.0),
+        (-0.1, 0.0, 0.0),
+        (-0.1, 0.0, 0.0),
+        (-0.1, 0.0, 0.0),
     ]
     assert fake.closed is True

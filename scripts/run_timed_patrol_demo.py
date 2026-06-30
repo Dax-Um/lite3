@@ -68,8 +68,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lane-count", type=int, default=DEFAULT_LANE_COUNT)
     parser.add_argument("--vx", type=float, default=DEFAULT_VX_MPS)
     parser.add_argument("--forward-sec", type=float, default=DEFAULT_FORWARD_SEC)
-    parser.add_argument("--turn-wz", type=float, default=DEFAULT_TURN_WZ_RADPS)
-    parser.add_argument("--turn-sec", type=float, default=DEFAULT_TURN_SEC)
+    parser.add_argument(
+        "--turn-wz",
+        type=float,
+        default=DEFAULT_TURN_WZ_RADPS,
+        help="Reserved for a future turn-around mode; ignored by the current shuttle plan.",
+    )
+    parser.add_argument(
+        "--turn-sec",
+        type=float,
+        default=DEFAULT_TURN_SEC,
+        help="Reserved for a future turn-around mode; ignored by the current shuttle plan.",
+    )
     parser.add_argument("--send-period-sec", type=float, default=DEFAULT_SEND_PERIOD_SEC)
     parser.add_argument(
         "--execute",
@@ -160,25 +170,17 @@ def build_plan(args: argparse.Namespace) -> list[Segment]:
     plan: list[Segment] = []
     for index in range(args.lane_count):
         lane_number = index + 1
+        direction = 1.0 if index % 2 == 0 else -1.0
+        suffix = "forward" if direction > 0.0 else "reverse"
         plan.append(
             Segment(
-                name=f"lane_{lane_number}_forward",
-                vx=args.vx,
+                name=f"lane_{lane_number}_{suffix}",
+                vx=args.vx * direction,
                 vy=0.0,
                 wz=0.0,
                 duration_sec=args.forward_sec,
             )
         )
-        if index < args.lane_count - 1:
-            plan.append(
-                Segment(
-                    name=f"lane_{lane_number}_turn",
-                    vx=0.0,
-                    vy=0.0,
-                    wz=args.turn_wz,
-                    duration_sec=args.turn_sec,
-                )
-            )
     return plan
 
 

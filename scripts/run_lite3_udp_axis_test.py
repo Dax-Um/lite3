@@ -58,6 +58,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Required for any non-zero command after physical safety checks are complete.",
     )
     parser.add_argument(
+        "--auto-mode-ok",
+        action="store_true",
+        help="Required for any non-zero command after the Lite3 App is switched to auto mode.",
+    )
+    parser.add_argument(
         "--allow-long-test",
         action="store_true",
         help="Allow duration longer than 1.0 second.",
@@ -84,6 +89,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(f"{args.axis} value exceeds limit {limit}")
     if args.value != 0.0 and not args.preflight_ok:
         raise SystemExit("non-zero command requires --preflight-ok")
+    if args.value != 0.0 and not args.auto_mode_ok:
+        raise SystemExit("non-zero command requires --auto-mode-ok")
     if (
         args.duration_sec > MAX_DURATION_SEC_WITHOUT_OVERRIDE
         and not args.allow_long_test

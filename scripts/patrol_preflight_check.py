@@ -3,6 +3,8 @@
 
 CHECKS = [
     "App manual mode 전환 가능",
+    "App auto mode 전환 가능",
+    "로봇 standing/ready 자세 확인",
     "E-stop 가능",
     "배터리 충분",
     "테스트 공간 앞뒤 3m 확보",

@@ -48,6 +48,21 @@ def test_rejects_nonzero_command_without_preflight_ok():
         script.validate_args(args)
 
 
+def test_rejects_nonzero_command_without_auto_mode_ok():
+    script = load_script()
+    args = script.parse_args([
+        "--axis",
+        "vx",
+        "--value",
+        "0.03",
+        "--preflight-ok",
+        *target_args(),
+    ])
+
+    with pytest.raises(SystemExit, match="--auto-mode-ok"):
+        script.validate_args(args)
+
+
 def test_allows_zero_command_without_preflight_ok():
     script = load_script()
     args = script.parse_args(["--axis", "vx", "--value", "0.0", *target_args()])
@@ -65,6 +80,7 @@ def test_rejects_long_duration_without_override():
         "--duration-sec",
         "1.5",
         "--preflight-ok",
+        "--auto-mode-ok",
         *target_args(),
     ])
 
@@ -74,7 +90,15 @@ def test_rejects_long_duration_without_override():
 
 def test_rejects_axis_limit_violation():
     script = load_script()
-    args = script.parse_args(["--axis", "vy", "--value", "0.06", "--preflight-ok", *target_args()])
+    args = script.parse_args([
+        "--axis",
+        "vy",
+        "--value",
+        "0.06",
+        "--preflight-ok",
+        "--auto-mode-ok",
+        *target_args(),
+    ])
 
     with pytest.raises(SystemExit, match="limit"):
         script.validate_args(args)
@@ -98,6 +122,7 @@ def test_run_axis_test_stops_before_and_after_command_loop(monkeypatch):
         "--duration-sec",
         "0.11",
         "--preflight-ok",
+        "--auto-mode-ok",
         *target_args(),
     ])
     script.validate_args(args)

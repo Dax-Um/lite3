@@ -1,7 +1,6 @@
 __pycache__/
 *.py[cod]
 .venv/
-lite3_env/
 .pytest_cache/
 .coverage
 htmlcov/

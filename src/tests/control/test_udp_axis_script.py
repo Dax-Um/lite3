@@ -5,6 +5,12 @@ import pytest
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[3] / "scripts" / "run_lite3_udp_axis_test.py"
+EXAMPLE_HOST = "203.0.113.10"
+EXAMPLE_PORT = "12000"
+
+
+def target_args() -> list[str]:
+    return ["--host", EXAMPLE_HOST, "--port", EXAMPLE_PORT]
 
 
 def load_script():
@@ -36,7 +42,7 @@ class FakeDriver:
 
 def test_rejects_nonzero_command_without_preflight_ok():
     script = load_script()
-    args = script.parse_args(["--axis", "vx", "--value", "0.03"])
+    args = script.parse_args(["--axis", "vx", "--value", "0.03", *target_args()])
 
     with pytest.raises(SystemExit, match="--preflight-ok"):
         script.validate_args(args)
@@ -44,7 +50,7 @@ def test_rejects_nonzero_command_without_preflight_ok():
 
 def test_allows_zero_command_without_preflight_ok():
     script = load_script()
-    args = script.parse_args(["--axis", "vx", "--value", "0.0"])
+    args = script.parse_args(["--axis", "vx", "--value", "0.0", *target_args()])
 
     script.validate_args(args)
 
@@ -59,6 +65,7 @@ def test_rejects_long_duration_without_override():
         "--duration-sec",
         "1.5",
         "--preflight-ok",
+        *target_args(),
     ])
 
     with pytest.raises(SystemExit, match="--allow-long-test"):
@@ -67,7 +74,7 @@ def test_rejects_long_duration_without_override():
 
 def test_rejects_axis_limit_violation():
     script = load_script()
-    args = script.parse_args(["--axis", "vy", "--value", "0.06", "--preflight-ok"])
+    args = script.parse_args(["--axis", "vy", "--value", "0.06", "--preflight-ok", *target_args()])
 
     with pytest.raises(SystemExit, match="limit"):
         script.validate_args(args)
@@ -91,6 +98,7 @@ def test_run_axis_test_stops_before_and_after_command_loop(monkeypatch):
         "--duration-sec",
         "0.11",
         "--preflight-ok",
+        *target_args(),
     ])
     script.validate_args(args)
     fake = FakeDriver(args.host, args.port, script.MotionLimits())

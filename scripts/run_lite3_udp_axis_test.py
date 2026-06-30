@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,8 +19,8 @@ if str(SRC_ROOT) not in sys.path:
 from lite3_common.types import MotionLimits
 from lite3_control.udp_driver import Lite3UdpDriver
 
-DEFAULT_HOST = "192.168.1.120"
-DEFAULT_PORT = 43893
+HOST_ENV = "LITE3_MOTION_HOST"
+PORT_ENV = "LITE3_MOTION_PORT"
 DEFAULT_DURATION_SEC = 0.5
 DEFAULT_SEND_PERIOD_SEC = 0.05
 PRE_STOP_REPEAT = 10
@@ -35,6 +36,13 @@ AXIS_LIMITS = {
 DriverFactory = Callable[[str, int, MotionLimits], Lite3UdpDriver]
 
 
+def _env_port() -> int | None:
+    raw_port = os.environ.get(PORT_ENV)
+    if raw_port is None:
+        return None
+    return int(raw_port)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Send a guarded single-axis Lite3 MotionComplexCMD UDP test."
@@ -42,8 +50,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--axis", choices=("vx", "vy", "wz"), required=True)
     parser.add_argument("--value", type=float, required=True)
     parser.add_argument("--duration-sec", type=float, default=DEFAULT_DURATION_SEC)
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--host", default=os.environ.get(HOST_ENV, ""))
+    parser.add_argument("--port", type=int, default=_env_port())
     parser.add_argument(
         "--preflight-ok",
         action="store_true",
@@ -66,6 +74,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--duration-sec must be positive")
     if not args.host:
         raise SystemExit("--host must be non-empty")
+    if args.port is None:
+        raise SystemExit("--port must be provided")
     if args.port < 1 or args.port > 65535:
         raise SystemExit("--port must be in range 1..65535")
 
@@ -107,7 +117,7 @@ def run_axis_test(
     try:
         print(
             f"starting axis test axis={args.axis} value={args.value} "
-            f"duration_sec={args.duration_sec} target={args.host}:{args.port}"
+            f"duration_sec={args.duration_sec}"
         )
         driver.stop(PRE_STOP_REPEAT, STOP_PERIOD_SEC)
         start = time.monotonic()

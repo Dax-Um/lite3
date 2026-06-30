@@ -28,7 +28,6 @@ DEFAULT_TURN_WZ_RADPS = 0.20
 DEFAULT_TURN_SEC = 0.8
 DEFAULT_LANE_COUNT = 2
 DEFAULT_SEND_PERIOD_SEC = 0.05
-DEFAULT_LOCAL_PORT = 43893
 
 SAFE_MAX_VX_MPS = 0.30
 SAFE_MAX_WZ_RADPS = 0.30
@@ -60,6 +59,13 @@ def _env_port() -> int | None:
     return int(raw_port)
 
 
+def _env_local_port() -> int | None:
+    raw_port = os.environ.get("LITE3_MOTION_LOCAL_PORT")
+    if raw_port is None or raw_port == "":
+        return None
+    return int(raw_port)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a guarded time-based Lite3 patrol demo over UDP."
@@ -74,8 +80,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--local-port",
         type=int,
-        default=int(os.environ.get("LITE3_MOTION_LOCAL_PORT", DEFAULT_LOCAL_PORT)),
-        help="Local UDP source port. Lite3 motion host expects 43893 in this setup.",
+        default=_env_local_port(),
+        help="Optional local UDP source port. Omit to let the OS choose an ephemeral port.",
     )
     parser.add_argument("--lane-count", type=int, default=DEFAULT_LANE_COUNT)
     parser.add_argument("--vx", type=float, default=DEFAULT_VX_MPS)

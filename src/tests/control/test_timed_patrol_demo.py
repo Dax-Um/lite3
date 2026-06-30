@@ -132,7 +132,7 @@ def test_run_timed_patrol_sends_stops_between_segments_and_final_stop():
         sleep=lambda _dt: None,
     )
 
-    assert created == [(EXAMPLE_HOST, int(EXAMPLE_PORT), "", 43893)]
+    assert created == [(EXAMPLE_HOST, int(EXAMPLE_PORT), "", None)]
     assert fake.stops == [
         (10, 0.05),
         (10, 0.05),

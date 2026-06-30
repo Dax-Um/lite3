@@ -30,6 +30,9 @@ class DriverSendError(RuntimeError):
 
 
 class DatagramSocket(Protocol):
+    def bind(self, address: tuple[str, int]) -> None:
+        ...
+
     def sendto(self, packet: bytes, address: tuple[str, int]) -> int:
         ...
 
@@ -48,6 +51,8 @@ class Lite3UdpDriver:
         port: int | None = None,
         limits: MotionLimits | None = None,
         *,
+        local_host: str | None = None,
+        local_port: int | None = None,
         sock: DatagramSocket | None = None,
     ):
         host = host or os.environ.get(DEFAULT_MOTION_HOST_ENV, "")
@@ -61,6 +66,10 @@ class Lite3UdpDriver:
         self.port = port
         self.limits = limits or MotionLimits()
         self._socket = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if local_port is not None:
+            if local_port < 1 or local_port > 65535:
+                raise ValueError("local_port must be in range 1..65535")
+            self._socket.bind((local_host or "", local_port))
         self._address = (self.host, self.port)
 
     def pack_motion_complex_cmd(self, cmd_code: int, value: float) -> bytes:

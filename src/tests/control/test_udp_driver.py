@@ -14,8 +14,12 @@ EXAMPLE_PORT = 12000
 class FakeSocket:
     def __init__(self, *, fail: bool = False):
         self.fail = fail
+        self.bound = []
         self.sent = []
         self.closed = False
+
+    def bind(self, address: tuple[str, int]) -> None:
+        self.bound.append(address)
 
     def sendto(self, packet: bytes, address: tuple[str, int]) -> int:
         if self.fail:
@@ -100,6 +104,32 @@ def test_invalid_host_is_rejected():
 def test_invalid_port_is_rejected():
     with pytest.raises(ValueError, match="port"):
         Lite3UdpDriver(EXAMPLE_HOST, 70000, MotionLimits(), sock=FakeSocket())
+
+
+def test_invalid_local_port_is_rejected():
+    with pytest.raises(ValueError, match="local_port"):
+        Lite3UdpDriver(
+            EXAMPLE_HOST,
+            EXAMPLE_PORT,
+            MotionLimits(),
+            local_port=70000,
+            sock=FakeSocket(),
+        )
+
+
+def test_local_port_binds_udp_source_socket():
+    fake_socket = FakeSocket()
+
+    Lite3UdpDriver(
+        EXAMPLE_HOST,
+        EXAMPLE_PORT,
+        MotionLimits(),
+        local_host="192.0.2.10",
+        local_port=43893,
+        sock=fake_socket,
+    )
+
+    assert fake_socket.bound == [("192.0.2.10", 43893)]
 
 
 def test_send_cmd_vel_sends_three_packets_to_motion_host():

@@ -28,6 +28,7 @@ DEFAULT_TURN_WZ_RADPS = 0.20
 DEFAULT_TURN_SEC = 0.8
 DEFAULT_LANE_COUNT = 2
 DEFAULT_SEND_PERIOD_SEC = 0.05
+DEFAULT_LOCAL_PORT = 43893
 
 SAFE_MAX_VX_MPS = 0.30
 SAFE_MAX_WZ_RADPS = 0.30
@@ -41,7 +42,7 @@ INTER_SEGMENT_STOP_REPEAT = 10
 FINAL_STOP_REPEAT = 60
 STOP_PERIOD_SEC = 0.05
 
-DriverFactory = Callable[[str, int, MotionLimits], Lite3UdpDriver]
+DriverFactory = Callable[..., Lite3UdpDriver]
 
 
 class Segment(NamedTuple):
@@ -65,6 +66,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--host", default=os.environ.get(HOST_ENV, ""))
     parser.add_argument("--port", type=int, default=_env_port())
+    parser.add_argument(
+        "--local-host",
+        default=os.environ.get("LITE3_MOTION_LOCAL_HOST", ""),
+        help="Local source IP to bind. Empty binds all local interfaces.",
+    )
+    parser.add_argument(
+        "--local-port",
+        type=int,
+        default=int(os.environ.get("LITE3_MOTION_LOCAL_PORT", DEFAULT_LOCAL_PORT)),
+        help="Local UDP source port. Lite3 motion host expects 43893 in this setup.",
+    )
     parser.add_argument("--lane-count", type=int, default=DEFAULT_LANE_COUNT)
     parser.add_argument("--vx", type=float, default=DEFAULT_VX_MPS)
     parser.add_argument("--forward-sec", type=float, default=DEFAULT_FORWARD_SEC)
@@ -127,6 +139,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--port must be provided")
     if args.port < 1 or args.port > 65535:
         raise SystemExit("--port must be in range 1..65535")
+    if args.local_port is not None and (
+        args.local_port < 1 or args.local_port > 65535
+    ):
+        raise SystemExit("--local-port must be in range 1..65535")
     if args.lane_count < 1 or args.lane_count > 4:
         raise SystemExit("--lane-count must be in range 1..4")
     if args.forward_sec <= 0.0:
@@ -200,7 +216,13 @@ def run_timed_patrol(
         max_vy_mps=0.01,
         max_wz_radps=max(abs(args.turn_wz), 0.01),
     )
-    driver = driver_factory(args.host, args.port, limits)
+    driver = driver_factory(
+        args.host,
+        args.port,
+        limits,
+        local_host=args.local_host,
+        local_port=args.local_port,
+    )
 
     try:
         print_plan(args, plan)

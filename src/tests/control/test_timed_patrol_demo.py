@@ -122,13 +122,17 @@ def test_run_timed_patrol_sends_stops_between_segments_and_final_stop():
     ])
     script.validate_args(args)
     fake = FakeDriver(args.host, args.port, script.MotionLimits())
+    created = []
 
     script.run_timed_patrol(
         args,
-        driver_factory=lambda host, port, limits: fake,
+        driver_factory=lambda host, port, limits, local_host=None, local_port=None: (
+            created.append((host, port, local_host, local_port)) or fake
+        ),
         sleep=lambda _dt: None,
     )
 
+    assert created == [(EXAMPLE_HOST, int(EXAMPLE_PORT), "", 43893)]
     assert fake.stops == [
         (10, 0.05),
         (10, 0.05),

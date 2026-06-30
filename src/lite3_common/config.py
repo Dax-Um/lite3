@@ -21,6 +21,8 @@ class Lite3NetworkConfig:
     motion_host_command_port: int
     iq9_management_ip: str
     iq9_robot_side_ip: str
+    iq9_robot_side_interface: str = "end0"
+    iq9_robot_side_ip_mode: str = "static"
 
 
 def load_lite3_network_config(workspace_root: str | Path) -> Lite3NetworkConfig:
@@ -32,6 +34,8 @@ def load_lite3_network_config(workspace_root: str | Path) -> Lite3NetworkConfig:
         motion_host_command_port=int(lite3["motion_host_command_port"]),
         iq9_management_ip=str(lite3["iq9_management_ip"]),
         iq9_robot_side_ip=str(lite3["iq9_robot_side_ip"]),
+        iq9_robot_side_interface=str(lite3.get("iq9_robot_side_interface", "end0")),
+        iq9_robot_side_ip_mode=str(lite3.get("iq9_robot_side_ip_mode", "static")),
     )
 
 

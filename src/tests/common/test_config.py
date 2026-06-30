@@ -21,7 +21,9 @@ def write_configs(root: Path) -> None:
                 f'  motion_host_ip: "{EXAMPLE_MOTION_HOST}"',
                 f"  motion_host_command_port: {EXAMPLE_COMMAND_PORT}",
                 f'  iq9_management_ip: "{EXAMPLE_MANAGEMENT_HOST}"',
+                '  iq9_robot_side_interface: "end0"',
                 f'  iq9_robot_side_ip: "{EXAMPLE_ROBOT_SIDE_HOST}"',
+                '  iq9_robot_side_ip_mode: "static"',
             ]
         ),
         encoding="utf-8",
@@ -48,6 +50,8 @@ def test_load_lite3_network_config_from_workspace_root(tmp_path):
     assert config.motion_host_command_port == EXAMPLE_COMMAND_PORT
     assert config.iq9_management_ip == EXAMPLE_MANAGEMENT_HOST
     assert config.iq9_robot_side_ip == EXAMPLE_ROBOT_SIDE_HOST
+    assert config.iq9_robot_side_interface == "end0"
+    assert config.iq9_robot_side_ip_mode == "static"
 
 
 def test_load_lite3_network_config_from_repo_root(tmp_path):

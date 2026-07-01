@@ -6,6 +6,7 @@ from lite3_ros.patrol_rclpy_node import (
     TopicTimestamps,
     build_readiness_input,
     format_status_text,
+    should_auto_start_patrol,
 )
 
 
@@ -51,3 +52,39 @@ def test_format_status_text_includes_output_and_readiness_reasons():
     assert "safe_cmd=0.000,0.000,0.000" in text
     assert "stop_reason=lidar_timeout" in text
     assert "boundary_min_front_m=0.510" in text
+
+
+def test_should_auto_start_patrol_requires_readiness_odom_and_not_started():
+    ready = ReadinessResult(ready=True, reasons=())
+    not_ready = ReadinessResult(ready=False, reasons=("scan_missing",))
+
+    assert should_auto_start_patrol(
+        auto_start=True,
+        readiness=ready,
+        timestamps=TopicTimestamps(odom=9.9),
+        already_started=False,
+    )
+    assert not should_auto_start_patrol(
+        auto_start=False,
+        readiness=ready,
+        timestamps=TopicTimestamps(odom=9.9),
+        already_started=False,
+    )
+    assert not should_auto_start_patrol(
+        auto_start=True,
+        readiness=not_ready,
+        timestamps=TopicTimestamps(odom=9.9),
+        already_started=False,
+    )
+    assert not should_auto_start_patrol(
+        auto_start=True,
+        readiness=ready,
+        timestamps=TopicTimestamps(odom=None),
+        already_started=False,
+    )
+    assert not should_auto_start_patrol(
+        auto_start=True,
+        readiness=ready,
+        timestamps=TopicTimestamps(odom=9.9),
+        already_started=True,
+    )

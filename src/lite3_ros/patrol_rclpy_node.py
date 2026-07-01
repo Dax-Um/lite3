@@ -83,6 +83,21 @@ def format_status_text(output, readiness: ReadinessResult) -> str:
     )
 
 
+def should_auto_start_patrol(
+    *,
+    auto_start: bool,
+    readiness: ReadinessResult,
+    timestamps: TopicTimestamps,
+    already_started: bool,
+) -> bool:
+    return (
+        auto_start
+        and readiness.ready
+        and timestamps.odom is not None
+        and not already_started
+    )
+
+
 class PatrolRclpyNode(Node):
     def __init__(
         self,
@@ -97,6 +112,7 @@ class PatrolRclpyNode(Node):
         readiness_gate: ReadinessGate | None = None,
         runtime_flags: RuntimeFlags = RuntimeFlags(),
         motion_output=None,
+        auto_start: bool = False,
         timer_period_sec: float = 0.05,
     ):
         if rclpy is None:
@@ -106,6 +122,8 @@ class PatrolRclpyNode(Node):
         self.readiness_gate = readiness_gate or ReadinessGate()
         self.runtime_flags = runtime_flags
         self.motion_output = motion_output
+        self.auto_start = auto_start
+        self._patrol_started = False
         self.timestamps = TopicTimestamps()
 
         self.status_publisher = self.create_publisher(String, status_topic, 10)
@@ -137,6 +155,7 @@ class PatrolRclpyNode(Node):
 
     def _on_operator_command(self, msg) -> None:
         self.bridge.handle_operator_command(str(msg.data), self._now())
+        self._patrol_started = str(msg.data) == "patrol_start" or self._patrol_started
 
     def _tick(self) -> None:
         now = self._now()
@@ -148,6 +167,15 @@ class PatrolRclpyNode(Node):
                 flags=self.runtime_flags,
             )
         )
+        if should_auto_start_patrol(
+            auto_start=self.auto_start,
+            readiness=readiness,
+            timestamps=self.timestamps,
+            already_started=self._patrol_started,
+        ):
+            self.bridge.handle_operator_command("patrol_start", now)
+            self._patrol_started = True
+            output = self.bridge.tick(now)
         self.status_publisher.publish(String(data=format_status_text(output, readiness)))
         self.cmd_vel_safe_publisher.publish(_to_twist_msg(output.safe_cmd))
         if self.motion_output is not None and readiness.ready:

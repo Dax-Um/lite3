@@ -1,0 +1,9 @@
+route_id: single_waypoint_smoke_001
+frame_id: map
+loop: false
+waypoints:
+  - id: near_forward_030m
+    x: 0.302
+    y: 0.015
+    yaw: -0.013
+    dwell_sec: 0.0

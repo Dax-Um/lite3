@@ -1,0 +1,15 @@
+[Unit]
+Description=Lite3 Robosense LiDAR driver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ysc
+WorkingDirectory=/home/ysc/lite_cog_ros2/system/scripts/lidar
+ExecStart=/home/ysc/lite3/scripts/perception_host_start_lidar.sh --execute
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

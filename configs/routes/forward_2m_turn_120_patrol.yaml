@@ -1,0 +1,12 @@
+route_id: forward_2m_turn_120_patrol
+frame_id: map
+min_distance_m: 2.0
+segments:
+  - id: p1
+    distance_m: 2.0
+    turn_deg: 0.0
+    dwell_sec: 0.0
+  - id: p2
+    distance_m: 2.0
+    turn_deg: 120.0
+    dwell_sec: 0.0

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lite3 IQ9 Status</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #f4f6f8;
+        color: #17202a;
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+      }
+      section {
+        min-height: 96px;
+        padding: 12px;
+        background: #ffffff;
+        border: 1px solid #d7dde3;
+        border-radius: 8px;
+      }
+      h2 {
+        margin: 0 0 8px;
+        font-size: 16px;
+      }
+      pre {
+        min-height: 320px;
+        padding: 16px;
+        overflow: auto;
+        background: #101820;
+        color: #e8eef3;
+        border-radius: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Lite3 IQ9 Status</h1>
+      <div class="grid">
+        <section id="map-panel">
+          <h2>2D Map</h2>
+          <div id="route-polyline">route: none</div>
+          <div id="local-costmap">local costmap: unknown</div>
+        </section>
+        <section id="robot-pose">
+          <h2>Robot Pose</h2>
+          <div>x: <span data-field="robot.x">-</span></div>
+          <div>y: <span data-field="robot.y">-</span></div>
+          <div>yaw: <span data-field="robot.yaw">-</span></div>
+        </section>
+        <section id="target-waypoint">
+          <h2>Target Waypoint</h2>
+          <div data-field="nav.current_waypoint">-</div>
+        </section>
+        <section id="rgb-stream">
+          <h2>RGB Stream</h2>
+          <div data-field="sensors.camera_ok">unknown</div>
+        </section>
+        <section id="localization-status">
+          <h2>Localization</h2>
+          <div data-field="robot.localization_ok">unknown</div>
+        </section>
+        <section id="cmd-vel-monitor">
+          <h2>cmd_vel</h2>
+          <div data-field="nav.last_cmd_vel">-</div>
+        </section>
+      </div>
+      <pre id="status">/api/status</pre>
+    </main>
+    <script>
+      function valueAt(payload, path) {
+        return path.split(".").reduce((value, key) => value && value[key], payload);
+      }
+
+      async function refresh() {
+        const target = document.getElementById("status");
+        const response = await fetch("/api/status");
+        const payload = await response.json();
+        target.textContent = JSON.stringify(payload, null, 2);
+        for (const node of document.querySelectorAll("[data-field]")) {
+          const value = valueAt(payload, node.dataset.field);
+          node.textContent = typeof value === "object" ? JSON.stringify(value) : String(value);
+        }
+        document.getElementById("route-polyline").textContent =
+          `route: ${payload.nav.active_route || "none"}`;
+        document.getElementById("local-costmap").textContent =
+          `local costmap age: ${payload.sensors.local_costmap_age_sec}`;
+      }
+      refresh();
+      setInterval(refresh, 1000);
+    </script>
+  </body>
+</html>

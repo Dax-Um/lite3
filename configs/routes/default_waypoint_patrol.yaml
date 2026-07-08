@@ -1,0 +1,14 @@
+route_id: default_patrol
+frame_id: map
+min_distance_m: 3.0
+offsets:
+  - id: p1
+    dx: 3.0
+    dy: 0.0
+    yaw_offset: 0.0
+    dwell_sec: 0.0
+  - id: p2
+    dx: 3.0
+    dy: 3.0
+    yaw_offset: 1.57079632679
+    dwell_sec: 0.0

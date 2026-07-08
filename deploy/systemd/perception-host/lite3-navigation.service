@@ -1,0 +1,19 @@
+[Unit]
+Description=Lite3 localization and Nav2 waypoint navigation
+After=network-online.target
+After=lite3-lidar.service
+Requires=lite3-lidar.service
+ConditionPathExists=/home/ysc/lite_cog_ros2/system/map/lite3.pcd
+ConditionPathExists=/home/ysc/lite_cog_ros2/system/map/lite3.yaml
+
+[Service]
+Type=simple
+User=ysc
+WorkingDirectory=/home/ysc/lite_cog_ros2/system/scripts/nav
+ExecStart=/home/ysc/lite3/scripts/perception_host_start_navigation.sh --execute
+ExecStop=/home/ysc/lite3/scripts/perception_host_stop_navigation.sh --execute
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

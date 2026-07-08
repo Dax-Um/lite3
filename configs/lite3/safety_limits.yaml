@@ -1,0 +1,15 @@
+motion_limits:
+  max_vx_mps: 0.10
+  max_vy_mps: 0.05
+  max_wz_radps: 0.20
+  test_duration_sec: 1.0
+
+timeouts:
+  command_timeout_sec: 0.30
+  lidar_timeout_sec: 0.50
+  odom_timeout_sec: 0.50
+  imu_timeout_sec: 0.50
+
+stop_policy:
+  repeat_count: 10
+  repeat_dt_sec: 0.05

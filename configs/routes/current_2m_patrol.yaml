@@ -1,0 +1,20 @@
+route_id: current_2m_loop
+frame_id: map
+loop: false
+waypoints:
+  - id: home
+    x: -0.073
+    y: 1.104
+    yaw: 0.035
+  - id: p1
+    x: 1.926
+    y: 1.174
+    yaw: 0.035
+  - id: p2
+    x: 1.856
+    y: 3.172
+    yaw: 1.60579632679
+  - id: home_return
+    x: -0.073
+    y: 1.104
+    yaw: 0.035

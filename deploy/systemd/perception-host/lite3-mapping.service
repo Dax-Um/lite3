@@ -1,0 +1,14 @@
+[Unit]
+Description=Lite3 manual SLAM mapping session
+After=network-online.target
+After=lite3-lidar.service
+Requires=lite3-lidar.service
+Conflicts=lite3-navigation.service
+
+[Service]
+Type=simple
+User=ysc
+WorkingDirectory=/home/ysc/lite_cog_ros2/system/scripts/slam
+ExecStart=/home/ysc/lite3/scripts/perception_host_start_mapping.sh --execute
+ExecStopPost=/home/ysc/lite3/scripts/perception_host_finish_mapping.sh --execute
+Restart=no

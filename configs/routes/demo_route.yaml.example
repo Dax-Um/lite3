@@ -1,0 +1,15 @@
+route_id: demo_loop_01
+frame_id: map
+loop: true
+waypoints:
+  - id: p1
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+    dwell_sec: 2.0
+  - id: p2
+    x: 1.0
+    y: 0.0
+    yaw: 0.0
+    dwell_sec: 2.0
+

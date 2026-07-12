@@ -1,1 +1,1 @@
-"""Perception components for patrol constraints."""
+"""Perception components for patrol constraints and vision."""

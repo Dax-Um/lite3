@@ -23,6 +23,8 @@ class Lite3NetworkConfig:
     iq9_robot_side_ip: str
     iq9_robot_side_interface: str = "end0"
     iq9_robot_side_ip_mode: str = "static"
+    camera_udp_bind_host: str = "0.0.0.0"
+    camera_udp_port: int = 5000
 
 
 def load_lite3_network_config(workspace_root: str | Path) -> Lite3NetworkConfig:
@@ -36,6 +38,8 @@ def load_lite3_network_config(workspace_root: str | Path) -> Lite3NetworkConfig:
         iq9_robot_side_ip=str(lite3["iq9_robot_side_ip"]),
         iq9_robot_side_interface=str(lite3.get("iq9_robot_side_interface", "end0")),
         iq9_robot_side_ip_mode=str(lite3.get("iq9_robot_side_ip_mode", "static")),
+        camera_udp_bind_host=str(lite3.get("camera_udp_bind_host", "0.0.0.0")),
+        camera_udp_port=int(lite3.get("camera_udp_port", 5000)),
     )
 
 

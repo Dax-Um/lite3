@@ -12,3 +12,6 @@ lite3:
   motion_host_local_port: 43893
   fallback_motion_host_ip: "192.168.2.1"
   fallback_note: "현재 장비에서는 192.168.2.1 ping/ssh 실패, 192.168.1.120 사용"
+  camera_udp_bind_host: "0.0.0.0"
+  camera_udp_port: 5000
+  camera_udp_note: "motion-host gst rtpjpegpay -> IQ9 robot-side IP port 5000"

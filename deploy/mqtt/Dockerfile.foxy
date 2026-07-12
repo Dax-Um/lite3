@@ -1,0 +1,18 @@
+FROM iq9-lite3-ros-foxy:latest
+
+USER root
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        gstreamer1.0-plugins-ugly \
+        openssh-client \
+        python3-pil \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.foxy.txt /tmp/lite3-mqtt-requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/lite3-mqtt-requirements.txt
+
+WORKDIR /workspace/lite3

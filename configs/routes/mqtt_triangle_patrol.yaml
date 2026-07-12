@@ -1,0 +1,5 @@
+route_id: mqtt_equilateral_triangle
+frame_id: map
+min_distance_m: 1.0
+equilateral_triangle_side_m: 2.0
+equilateral_triangle_heading_deg: 0.0

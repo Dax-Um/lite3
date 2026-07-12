@@ -1,0 +1,6 @@
+route_id: mqtt_forward_patrol
+frame_id: map
+min_distance_m: 3.0
+forward_distances_m:
+  - 3.0
+  - 6.0

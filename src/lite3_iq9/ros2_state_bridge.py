@@ -76,6 +76,8 @@ def _twist_from_msg(msg) -> Twist2D:
 
 
 def _status_ok(msg) -> bool:
+    if hasattr(msg, "has_converged"):
+        return bool(msg.has_converged)
     if hasattr(msg, "data"):
         return bool(msg.data)
     if hasattr(msg, "localization_ok"):

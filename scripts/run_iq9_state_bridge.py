@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         import rclpy
         from geometry_msgs.msg import Twist
         from nav_msgs.msg import OccupancyGrid, Odometry
-        from std_msgs.msg import Bool
+        from hdl_localization.msg import ScanMatchingStatus
     except ImportError as exc:
         print(f"ROS2 runtime unavailable: {exc}", file=sys.stderr)
         return 2
@@ -73,7 +73,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         node.create_subscription(Odometry, "/odom", lambda msg: bridge.on_odom(msg, now()), 10)
-        node.create_subscription(Bool, "/status", lambda msg: bridge.on_status(msg, now()), 10)
+        node.create_subscription(
+            ScanMatchingStatus,
+            "/status",
+            lambda msg: bridge.on_status(msg, now()),
+            10,
+        )
         node.create_subscription(OccupancyGrid, "/map", lambda msg: bridge.on_map(msg, now()), 10)
         node.create_subscription(
             OccupancyGrid,

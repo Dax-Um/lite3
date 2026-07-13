@@ -15,4 +15,15 @@ RUN apt-get update \
 COPY requirements.foxy.txt /tmp/lite3-mqtt-requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/lite3-mqtt-requirements.txt
 
+COPY hdl_localization /tmp/lite3_overlay_src/src/hdl_localization
+RUN . /opt/ros/foxy/setup.sh \
+    && cd /tmp/lite3_overlay_src \
+    && colcon build --install-base /opt/lite3_overlay \
+    && rm -rf /tmp/lite3_overlay_src
+
+COPY entrypoint.sh /usr/local/bin/lite3-mqtt-entrypoint
+RUN chmod +x /usr/local/bin/lite3-mqtt-entrypoint
+
 WORKDIR /workspace/lite3
+
+ENTRYPOINT ["/usr/local/bin/lite3-mqtt-entrypoint"]

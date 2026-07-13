@@ -4,10 +4,10 @@ from lite3_mqtt.media import DetectionMediaPublisher
 
 class FakeMediaSource:
     def capture_image(self, detection_type, event_id):
-        return b"annotated-jpeg"
+        return b"\xff\xd8annotated-jpeg\xff\xd9"
 
     def capture_video(self, detection_type, event_id, duration_ms):
-        return b"annotated-mp4"
+        return b"\x00\x00\x00\x18ftypmp42"
 
 
 def test_detection_publishes_image_before_video_with_same_event_id():

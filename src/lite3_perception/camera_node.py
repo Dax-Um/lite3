@@ -49,8 +49,9 @@ class UdpCameraNode:
         self.receiver = receiver or UdpJpegCameraReceiver(
             self.config.udp, on_frame=self._handle_frame
         )
-        # If caller provided a receiver without wiring, still hook it.
-        if receiver is not None and receiver.on_frame is None:
+        self._receiver_callback = None
+        if receiver is not None:
+            self._receiver_callback = receiver.on_frame
             receiver.on_frame = self._handle_frame
 
         self._stop = threading.Event()
@@ -95,6 +96,11 @@ class UdpCameraNode:
             self._frames_forwarded += 1
         if self.on_frame is not None:
             self.on_frame(frame)
+        if (
+            self._receiver_callback is not None
+            and self._receiver_callback is not self.on_frame
+        ):
+            self._receiver_callback(frame)
 
     def _status_loop(self) -> None:
         period = max(0.2, self.config.status_period_sec)

@@ -95,6 +95,8 @@ class PerceptionNode:
         on_result: ResultCallback | None = None,
     ):
         self.config = config or PerceptionNodeConfig()
+        if self.config.target_fps < 0.0:
+            raise ValueError("target_fps must be zero or positive")
         self.detector: FrameDetector = detector or PassthroughDetector()
         self.on_result = on_result
         self._frames_processed = 0
@@ -134,7 +136,11 @@ class PerceptionNode:
             return None
         frame = CameraFrame(
             jpeg_bytes=jpeg_bytes,
-            timestamp_monotonic=frame_timestamp_monotonic or now,
+            timestamp_monotonic=(
+                now
+                if frame_timestamp_monotonic is None
+                else frame_timestamp_monotonic
+            ),
             width=width,
             height=height,
             sequence=sequence,

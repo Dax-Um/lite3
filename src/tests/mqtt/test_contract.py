@@ -42,20 +42,20 @@ def test_media_payloads_encode_bytes_and_keep_independent_timestamps():
     image = build_image_payload(
         event_id="event-1",
         detection_type=DetectionType.BROKEN_CUP,
-        jpeg_bytes=b"jpeg",
+        jpeg_bytes=b"\xff\xd8jpeg\xff\xd9",
         clock_ms=clock,
     )
     video = build_video_payload(
         event_id="event-1",
         detection_type=DetectionType.BROKEN_CUP,
-        mp4_bytes=b"mp4",
+        mp4_bytes=b"\x00\x00\x00\x18ftypmp42",
         duration_ms=5000,
         clock_ms=clock,
     )
     assert image["event_id"] == video["event_id"]
     assert image["timestamp"] != video["timestamp"]
-    assert base64.b64decode(image["image"]["data_base64"]) == b"jpeg"
-    assert base64.b64decode(video["video"]["data_base64"]) == b"mp4"
+    assert base64.b64decode(image["image"]["data_base64"]) == b"\xff\xd8jpeg\xff\xd9"
+    assert base64.b64decode(video["video"]["data_base64"]) == b"\x00\x00\x00\x18ftypmp42"
 
 
 def test_empty_media_uses_fail_result_and_empty_base64():
@@ -66,3 +66,21 @@ def test_empty_media_uses_fail_result_and_empty_base64():
     )
     assert payload["result"] == "FAIL"
     assert payload["image"]["data_base64"] == ""
+
+
+def test_corrupt_media_is_reported_as_fail_not_success():
+    image = build_image_payload(
+        event_id="event-1",
+        detection_type=DetectionType.COYOTE,
+        jpeg_bytes=b"not-a-jpeg",
+    )
+    video = build_video_payload(
+        event_id="event-1",
+        detection_type=DetectionType.COYOTE,
+        mp4_bytes=b"not-an-mp4",
+        duration_ms=5000,
+    )
+    assert image["result"] == "FAIL"
+    assert video["result"] == "FAIL"
+    assert image["image"]["data_base64"] == ""
+    assert video["video"]["data_base64"] == ""

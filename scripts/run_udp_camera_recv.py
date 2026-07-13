@@ -111,11 +111,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     " ".join(
                         [
-                            f"pkts={stats.packets_received}",
                             f"frames={stats.frames_completed}",
                             f"fps={fps:.1f}",
                             f"bytes={stats.bytes_received}",
-                            f"src={stats.last_source_addr}",
+                            f"backend={stats.backend}",
                             f"age={age if age is not None else -1:.3f}",
                             f"err={stats.last_error!r}",
                         ]
@@ -129,8 +128,7 @@ def main(argv: list[str] | None = None) -> int:
 
     stats = receiver.stats
     print(
-        f"done frames={stats.frames_completed} packets={stats.packets_received} "
-        f"saved={saved}",
+        f"done frames={stats.frames_completed} bytes={stats.bytes_received} saved={saved}",
         flush=True,
     )
     return 0 if stats.frames_completed > 0 or args.seconds == 0 else 1

@@ -1,5 +1,7 @@
 """Unit tests for GStreamer pipeline string helpers (no live UDP required)."""
 
+import pytest
+
 from lite3_perception.udp_camera_receiver import (
     UdpCameraConfig,
     build_jpeg_appsink_pipeline,
@@ -31,3 +33,24 @@ def test_opencv_pipeline_decodes_to_bgr():
     assert "jpegdec" in pipe
     assert "appsink" in pipe
     assert "rtpjpegdepay" in pipe
+
+
+def test_bind_host_is_applied_to_both_receiver_pipelines():
+    config = UdpCameraConfig(bind_host="192.168.1.215", port=5000)
+    assert "address=192.168.1.215" in build_jpeg_appsink_pipeline(config)
+    assert "address=192.168.1.215" in build_opencv_bgr_pipeline(config)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"port": 0},
+        {"port": 65536},
+        {"payload_type": 128},
+        {"max_buffers": 0},
+        {"read_timeout_sec": 0.0},
+    ],
+)
+def test_invalid_udp_camera_config_is_rejected(kwargs):
+    with pytest.raises(ValueError):
+        UdpCameraConfig(**kwargs)

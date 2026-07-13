@@ -83,6 +83,8 @@ def parse_patrol_command(payload: Union[bytes, str]) -> PatrolCommand:
 def parse_detection_trigger(topic: str, payload: Union[bytes, str]) -> DetectionTrigger:
     value = decode_object(payload)
     event_id = _required_string(value, "event_id")
+    if len(event_id) > 128:
+        raise ValueError("event_id must be at most 128 characters")
     timestamp = _required_epoch_ms(value)
     event_type = _required_string(value, "event_type")
 
@@ -110,7 +112,8 @@ def build_image_payload(
     jpeg_bytes: Union[bytes, None],
     clock_ms: Callable[[], int] = epoch_ms,
 ) -> Dict[str, Any]:
-    success = bool(jpeg_bytes)
+    event_id = _validated_event_id(event_id)
+    success = _is_jpeg(jpeg_bytes)
     return {
         "event_id": event_id,
         "timestamp": int(clock_ms()),
@@ -118,7 +121,7 @@ def build_image_payload(
         "result": Result.SUCCESS.value if success else Result.FAIL.value,
         "image": {
             "format": "jpeg",
-            "data_base64": _base64(jpeg_bytes),
+            "data_base64": _base64(jpeg_bytes if success else None),
         },
     }
 
@@ -131,9 +134,10 @@ def build_video_payload(
     duration_ms: int,
     clock_ms: Callable[[], int] = epoch_ms,
 ) -> Dict[str, Any]:
-    if duration_ms <= 0:
-        raise ValueError("duration_ms must be positive")
-    success = bool(mp4_bytes)
+    event_id = _validated_event_id(event_id)
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms <= 0:
+        raise ValueError("duration_ms must be a positive integer")
+    success = _is_mp4(mp4_bytes)
     return {
         "event_id": event_id,
         "timestamp": int(clock_ms()),
@@ -142,25 +146,25 @@ def build_video_payload(
         "video": {
             "format": "mp4",
             "duration_ms": int(duration_ms),
-            "data_base64": _base64(mp4_bytes),
+            "data_base64": _base64(mp4_bytes if success else None),
         },
     }
 
 
 def image_topic(detection_type: DetectionType) -> str:
-    return (
-        Topics.BROKEN_CUP_IMAGE
-        if detection_type is DetectionType.BROKEN_CUP
-        else Topics.COYOTE_IMAGE
-    )
+    if detection_type is DetectionType.BROKEN_CUP:
+        return Topics.BROKEN_CUP_IMAGE
+    if detection_type is DetectionType.COYOTE:
+        return Topics.COYOTE_IMAGE
+    raise ValueError("unsupported detection type: {!r}".format(detection_type))
 
 
 def video_topic(detection_type: DetectionType) -> str:
-    return (
-        Topics.BROKEN_CUP_VIDEO
-        if detection_type is DetectionType.BROKEN_CUP
-        else Topics.COYOTE_VIDEO
-    )
+    if detection_type is DetectionType.BROKEN_CUP:
+        return Topics.BROKEN_CUP_VIDEO
+    if detection_type is DetectionType.COYOTE:
+        return Topics.COYOTE_VIDEO
+    raise ValueError("unsupported detection type: {!r}".format(detection_type))
 
 
 def compact_json(payload: Dict[str, Any]) -> str:
@@ -169,6 +173,23 @@ def compact_json(payload: Dict[str, Any]) -> str:
 
 def _base64(data: Union[bytes, None]) -> str:
     return "" if not data else base64.b64encode(data).decode("ascii")
+
+
+def _validated_event_id(event_id: str) -> str:
+    if not isinstance(event_id, str) or not event_id.strip():
+        raise ValueError("event_id must be a non-empty string")
+    value = event_id.strip()
+    if len(value) > 128:
+        raise ValueError("event_id must be at most 128 characters")
+    return value
+
+
+def _is_jpeg(data: Union[bytes, None]) -> bool:
+    return bool(data and len(data) >= 4 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9")
+
+
+def _is_mp4(data: Union[bytes, None]) -> bool:
+    return bool(data and len(data) >= 12 and data[4:8] == b"ftyp")
 
 
 def _required_string(value: Dict[str, Any], key: str) -> str:

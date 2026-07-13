@@ -27,5 +27,15 @@ if [ "$MODE" = "dry-run" ]; then
   exit 0
 fi
 
-pkill -f "start_nav.sh|controller_server|planner_server|waypoint_follower" 2>/dev/null || true
-echo "navigation stop requested"
+PATTERN="start_nav.sh|hdl_localization|nav2_map_server/map_server|nav2_lifecycle_manager/lifecycle_manager|nav2_controller/controller_server|nav2_planner/planner_server|nav2_recoveries/recoveries_server|nav2_bt_navigator/bt_navigator|nav2_waypoint_follower/waypoint_follower|global_map_server|motion_sender"
+pkill -f "$PATTERN" 2>/dev/null || true
+for _ in $(seq 1 30); do
+  if ! pgrep -af "$PATTERN" >/dev/null; then
+    echo "navigation stopped"
+    exit 0
+  fi
+  sleep 0.1
+done
+echo "navigation processes did not stop cleanly" >&2
+pgrep -af "$PATTERN" >&2 || true
+exit 1

@@ -35,10 +35,14 @@ if [ "$MODE" = "dry-run" ]; then
 fi
 
 if pgrep -af "start_rslidar.sh|rslidar" >/dev/null; then
-  echo "rslidar already running"
-  exit 0
+  if ros2 topic list | grep -Fxq /rslidar_points; then
+    echo "rslidar already running and publishing /rslidar_points"
+    exit 0
+  fi
+  echo "partial LiDAR process detected without /rslidar_points" >&2
+  exit 1
 fi
 
 cd "$LIDAR_DIR"
 bash "$LIDAR_SCRIPT"
-ros2 topic list | grep /rslidar_points
+ros2 topic list | grep -Fxq /rslidar_points

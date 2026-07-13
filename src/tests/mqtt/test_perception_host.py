@@ -29,18 +29,19 @@ def failed(detail="not ready"):
 
 
 def test_ready_navigation_only_checks_status():
-    runner = FakeRunner([ok()])
+    runner = FakeRunner([ok(), ok()])
     manager = PerceptionHostNavManager(PerceptionHostConfig(), runner=runner)
 
     manager.ensure_navigation()
 
-    assert len(runner.commands) == 1
+    assert len(runner.commands) == 2
     assert "perception_host_nav_status.sh" in runner.commands[0][0][-1]
+    assert "perception_host_start_watchdog.sh" in runner.commands[1][0][-1]
     assert "ysc@192.168.1.103" in runner.commands[0][0]
 
 
 def test_not_ready_starts_existing_wrapper_then_polls_status():
-    runner = FakeRunner([failed(), ok(), ok(), failed(), ok()])
+    runner = FakeRunner([failed(), ok(), ok(), failed(), ok(), ok()])
     ticks = iter([0.0, 0.0, 1.0])
     manager = PerceptionHostNavManager(
         PerceptionHostConfig(ready_timeout_sec=10.0),
@@ -57,6 +58,7 @@ def test_not_ready_starts_existing_wrapper_then_polls_status():
     assert "perception_host_start_navigation.sh" in remote_commands[2]
     assert "perception_host_nav_status.sh" in remote_commands[3]
     assert "perception_host_nav_status.sh" in remote_commands[4]
+    assert "perception_host_start_watchdog.sh" in remote_commands[5]
 
 
 def test_auto_start_can_be_disabled():
@@ -76,12 +78,15 @@ def test_startup_gate_uses_existing_ros_graph_without_ssh():
         def ensure_navigation(self):
             calls.append("ssh")
 
+        def ensure_watchdog(self):
+            calls.append("watchdog")
+
     class Backend:
         def wait_until_ready(self, timeout_sec=None):
             calls.append("ros")
 
     PerceptionHostStartupGate(Manager(), Backend()).ensure_ready()
-    assert calls == ["ros"]
+    assert calls == ["ros", "watchdog"]
 
 
 def test_startup_gate_starts_remote_nav_only_when_ros_graph_is_missing():

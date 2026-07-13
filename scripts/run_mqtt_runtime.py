@@ -51,6 +51,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--perception-remote-root", default="/home/ysc/lite3")
     parser.add_argument("--perception-connect-timeout-sec", type=float, default=5.0)
     parser.add_argument("--perception-ready-timeout-sec", type=float, default=90.0)
+    parser.add_argument("--nav-data-stale-sec", type=float, default=2.0)
+    parser.add_argument("--nav-route-timeout-sec", type=float, default=300.0)
+    parser.add_argument("--nav-cancel-timeout-sec", type=float, default=5.0)
+    parser.add_argument("--max-lateral-speed-mps", type=float, default=0.02)
     parser.add_argument("--no-auto-start-perception-nav", action="store_true")
     parser.add_argument("--mock-home", nargs=3, type=float, default=(0.0, 0.0, 0.0))
     parser.add_argument("--mock-route-duration-sec", type=float, default=0.2)
@@ -85,6 +89,10 @@ def main(argv=None) -> int:
             odom_topic=args.odom_topic,
             action_name=args.action_name,
             timeout_sec=args.perception_ready_timeout_sec,
+            max_data_age_sec=args.nav_data_stale_sec,
+            max_lateral_speed_mps=args.max_lateral_speed_mps,
+            route_timeout_sec=args.nav_route_timeout_sec,
+            cancel_timeout_sec=args.nav_cancel_timeout_sec,
         )
         manager = PerceptionHostNavManager(
             PerceptionHostConfig(
@@ -119,6 +127,11 @@ def main(argv=None) -> int:
     def on_message(topic: str, payload: bytes) -> None:
         runtime_holder["runtime"].handle_message(topic, payload)
 
+    def on_connection_lost() -> None:
+        runtime = runtime_holder.get("runtime")
+        if runtime is not None:
+            runtime.handle_connection_lost()
+
     client = PahoMqttClient(
         MqttConfig(
             host=args.broker_host,
@@ -128,6 +141,7 @@ def main(argv=None) -> int:
             password=args.password,
         ),
         on_message=on_message,
+        on_connection_lost=on_connection_lost,
         logger=logger,
     )
     media_publisher = DetectionMediaPublisher(

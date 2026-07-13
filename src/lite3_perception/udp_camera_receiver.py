@@ -38,6 +38,20 @@ class UdpCameraConfig:
     open_timeout_sec: float = 5.0
     read_timeout_sec: float = 1.0
 
+    def __post_init__(self) -> None:
+        if not self.bind_host.strip():
+            raise ValueError("bind_host must be non-empty")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("port must be in 1..65535")
+        if not 0 <= self.payload_type <= 127:
+            raise ValueError("payload_type must be in 0..127")
+        if self.max_buffers <= 0:
+            raise ValueError("max_buffers must be positive")
+        if not 1 <= self.jpeg_quality <= 100:
+            raise ValueError("jpeg_quality must be in 1..100")
+        if self.open_timeout_sec <= 0.0 or self.read_timeout_sec <= 0.0:
+            raise ValueError("camera timeout values must be positive")
+
 
 @dataclass(frozen=True)
 class CameraFrame:
@@ -83,9 +97,8 @@ def build_jpeg_appsink_pipeline(config: UdpCameraConfig) -> str:
     caps = build_rtp_jpeg_caps(config.payload_type)
     drop = "true" if config.drop else "false"
     # Do not quote caps with nested double-quotes (breaks OpenCV/Gst parse).
-    # address is omitted: udpsrc defaults to 0.0.0.0.
     return (
-        f"udpsrc port={config.port} caps={caps} "
+        f"udpsrc address={config.bind_host} port={config.port} caps={caps} "
         f"! rtpjpegdepay ! jpegparse "
         f"! appsink name=sink sync=false max-buffers={config.max_buffers} drop={drop}"
     )
@@ -95,7 +108,7 @@ def build_opencv_bgr_pipeline(config: UdpCameraConfig) -> str:
     """OpenCV CAP_GSTREAMER fallback (decoded BGR, then re-encoded JPEG)."""
     # OpenCV is picky: no name= on appsink, simple caps.
     return (
-        f"udpsrc port={config.port} ! "
+        f"udpsrc address={config.bind_host} port={config.port} ! "
         f"application/x-rtp,encoding-name=JPEG,payload={int(config.payload_type)} ! "
         f"rtpjpegdepay ! jpegdec ! videoconvert ! appsink"
     )
@@ -137,12 +150,15 @@ class UdpJpegCameraReceiver:
 
     def stop(self, join_timeout: float = 2.0) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=join_timeout)
-            self._thread = None
         if self._backend_impl is not None:
             self._backend_impl.close()
-            self._backend_impl = None
+        if self._thread is not None:
+            self._thread.join(timeout=join_timeout)
+            if self._thread.is_alive():
+                raise TimeoutError("UDP camera receiver did not stop within timeout")
+            self._thread = None
+        self._backend_impl = None
+        self.stats.open_ok = False
 
     def get_latest_frame(self) -> CameraFrame | None:
         with self._lock:

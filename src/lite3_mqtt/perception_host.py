@@ -76,6 +76,7 @@ class PerceptionHostNavManager:
         status = self._remote_wrapper("perception_host_nav_status.sh", "--execute")
         if status.returncode == 0:
             self.logger.info("perception host navigation is already ready")
+            self.ensure_watchdog()
             return
         if not self.config.auto_start_navigation:
             raise RuntimeError(self._failure("perception host navigation is not ready", status))
@@ -97,11 +98,17 @@ class PerceptionHostNavManager:
             )
             if last_status.returncode == 0:
                 self.logger.info("perception host navigation became ready")
+                self.ensure_watchdog()
                 return
             self.sleep(self.config.poll_interval_sec)
         raise TimeoutError(
             self._failure("perception host navigation readiness timed out", last_status)
         )
+
+    def ensure_watchdog(self) -> None:
+        result = self._remote_wrapper("perception_host_start_watchdog.sh", "--execute")
+        if result.returncode != 0:
+            raise RuntimeError(self._failure("perception host watchdog start failed", result))
 
     def _remote_wrapper(self, name: str, mode: str) -> CommandResult:
         script = PurePosixPath(self.config.remote_root) / "scripts" / name
@@ -152,6 +159,7 @@ class PerceptionHostStartupGate:
     def ensure_ready(self) -> None:
         try:
             self.nav2_backend.wait_until_ready(timeout_sec=self.initial_probe_timeout_sec)
+            self.manager.ensure_watchdog()
             return
         except TimeoutError:
             pass

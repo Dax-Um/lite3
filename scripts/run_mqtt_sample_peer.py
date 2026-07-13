@@ -21,7 +21,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("patrol-start", "patrol-stop", "sound", "coyote", "scenario", "listen"),
+        choices=(
+            "patrol-start",
+            "patrol-stop",
+            "patrol-return-home",
+            "patrol-emergency-stop",
+            "patrol-reset",
+            "sound",
+            "coyote",
+            "scenario",
+            "listen",
+        ),
     )
     parser.add_argument("--broker-host", default="127.0.0.1")
     parser.add_argument("--broker-port", type=int, default=1883)
@@ -70,7 +80,7 @@ def main(argv=None) -> int:
         if args.command == "scenario":
             return _scenario(client, received, receive_event, args.timeout_sec)
         topic, payload = _message(args.command)
-        client.publish(topic, json.dumps(payload, separators=(",", ":")), qos=0, retain=False)
+        _publish(client, topic, payload)
         print(json.dumps({"published": topic, "payload": payload}))
         return 0
     finally:
@@ -81,7 +91,7 @@ def main(argv=None) -> int:
 def _scenario(client, received, receive_event, timeout_sec: float) -> int:
     for command in ("patrol-start", "sound", "coyote"):
         topic, payload = _message(command)
-        client.publish(topic, json.dumps(payload, separators=(",", ":")), qos=0, retain=False)
+        _publish(client, topic, payload)
     expected = {
         Topics.BROKEN_CUP_IMAGE,
         Topics.BROKEN_CUP_VIDEO,
@@ -95,7 +105,7 @@ def _scenario(client, received, receive_event, timeout_sec: float) -> int:
         receive_event.clear()
         receive_event.wait(timeout=0.2)
     stop_topic, stop_payload = _message("patrol-stop")
-    client.publish(stop_topic, json.dumps(stop_payload, separators=(",", ":")), qos=0, retain=False)
+    _publish(client, stop_topic, stop_payload)
 
     topics = [topic for topic, _ in received]
     if not expected.issubset(set(topics)):
@@ -119,6 +129,12 @@ def _message(command):
         return Topics.AUTO_PATROL, {"timestamp": now, "action": "START"}
     if command == "patrol-stop":
         return Topics.AUTO_PATROL, {"timestamp": now, "action": "STOP"}
+    if command == "patrol-return-home":
+        return Topics.AUTO_PATROL, {"timestamp": now, "action": "RETURN_HOME"}
+    if command == "patrol-emergency-stop":
+        return Topics.AUTO_PATROL, {"timestamp": now, "action": "EMERGENCY_STOP"}
+    if command == "patrol-reset":
+        return Topics.AUTO_PATROL, {"timestamp": now, "action": "RESET"}
     if command == "sound":
         return Topics.SOUND_DETECT, {
             "event_id": f"sound-{now}",
@@ -132,6 +148,18 @@ def _message(command):
             "event_type": "COYOTE_DETECTED",
         }
     raise ValueError(command)
+
+
+def _publish(client, topic, payload) -> None:
+    info = client.publish(
+        topic,
+        json.dumps(payload, separators=(",", ":")),
+        qos=0,
+        retain=False,
+    )
+    info.wait_for_publish(timeout=5.0)
+    if not info.is_published():
+        raise TimeoutError("sample MQTT publish timed out topic={}".format(topic))
 
 
 def _validate_event_pair(received, image_topic, video_topic):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import pytest
 
 from lite3_perception.perception_node import (
     Detection,
@@ -61,3 +62,18 @@ def test_detector_error_status():
     result = node.process_frame(_frame())
     assert result.status == "error"
     assert "boom" in result.detail
+
+
+def test_negative_target_fps_is_rejected():
+    with pytest.raises(ValueError, match="target_fps"):
+        PerceptionNode(PerceptionNodeConfig(target_fps=-1.0))
+
+
+def test_zero_monotonic_timestamp_is_preserved():
+    node = PerceptionNode(detector=PassthroughDetector())
+    result = node.process_jpeg(
+        b"\xff\xd8\xff\xd9",
+        frame_timestamp_monotonic=0.0,
+    )
+    assert result is not None
+    assert result.frame_timestamp_monotonic == 0.0

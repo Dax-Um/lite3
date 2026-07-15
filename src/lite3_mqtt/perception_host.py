@@ -48,7 +48,7 @@ class PerceptionHostConfig:
     user: str = "ysc"
     remote_root: str = "/home/ysc/lite3"
     connect_timeout_sec: float = 5.0
-    command_timeout_sec: float = 30.0
+    command_timeout_sec: float = 60.0
     ready_timeout_sec: float = 90.0
     poll_interval_sec: float = 2.0
     auto_start_navigation: bool = True
@@ -149,19 +149,13 @@ class PerceptionHostStartupGate:
         self,
         manager: PerceptionHostNavManager,
         nav2_backend,
-        *,
-        initial_probe_timeout_sec: float = 3.0,
     ) -> None:
         self.manager = manager
         self.nav2_backend = nav2_backend
-        self.initial_probe_timeout_sec = initial_probe_timeout_sec
 
     def ensure_ready(self) -> None:
-        try:
-            self.nav2_backend.wait_until_ready(timeout_sec=self.initial_probe_timeout_sec)
-            self.manager.ensure_watchdog()
-            return
-        except TimeoutError:
-            pass
+        # A discoverable ROS graph can outlive fresh LiDAR data.  Always run
+        # the perception-host status/start gate first; its status wrapper
+        # verifies a live point stream before any navigation goal is allowed.
         self.manager.ensure_navigation()
         self.nav2_backend.wait_until_ready()

@@ -1,5 +1,7 @@
 """Top-level patrol behavior controller."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from math import hypot, pi
 

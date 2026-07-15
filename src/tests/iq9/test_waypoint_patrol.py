@@ -31,8 +31,8 @@ def test_start_patrol_builds_default_three_point_route_from_home_pose():
     assert route.waypoints[-1].x == pytest.approx(home.x)
     assert route.waypoints[-1].y == pytest.approx(home.y)
     assert route.waypoints[-1].yaw == pytest.approx(home.yaw)
-    assert _distance(home, route.waypoints[1]) >= 3.0
-    assert _distance(home, route.waypoints[2]) >= 3.0
+    assert _distance(home, route.waypoints[1]) >= 3.0 - 1e-9
+    assert _distance(home, route.waypoints[2]) >= 3.0 - 1e-9
 
 
 def test_start_patrol_rotates_default_offsets_by_home_yaw():

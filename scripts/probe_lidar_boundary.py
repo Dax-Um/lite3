@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Probe front LiDAR boundary detection from a ROS2 LaserScan topic."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 import math

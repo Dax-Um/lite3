@@ -1,5 +1,7 @@
 """Mapless patrol finite state machine."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 
 from lite3_behavior.patrol_events import PatrolEvent, PatrolState

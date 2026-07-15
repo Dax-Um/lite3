@@ -1,5 +1,7 @@
 """Actual ROS2 rclpy node wiring for Lite3 LiDAR patrol runtime."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import time
 

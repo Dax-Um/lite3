@@ -1,5 +1,7 @@
 """Direct odom-line return-home controller."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
 from math import atan2, hypot, pi

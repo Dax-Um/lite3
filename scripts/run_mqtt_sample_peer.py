@@ -36,11 +36,29 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--broker-host", default="127.0.0.1")
     parser.add_argument("--broker-port", type=int, default=1883)
     parser.add_argument("--timeout-sec", type=float, default=15.0)
+    parser.add_argument(
+        "--allow-patrol-start",
+        action="store_true",
+        help=(
+            "explicitly allow commands that can move or re-enable the robot; "
+            "without this flag scenario only exercises detection media"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if _requires_motion_authorization(args.command) and not args.allow_patrol_start:
+        print(
+            "refusing {}: this command can move or re-enable the robot; add "
+            "--allow-patrol-start only for an authorized motion test".format(
+                args.command
+            ),
+            file=sys.stderr,
+        )
+        return 3
+
     import paho.mqtt.client as mqtt
 
     client = mqtt.Client(
@@ -50,35 +68,70 @@ def main(argv=None) -> int:
         protocol=mqtt.MQTTv311,
     )
 
-    connected = threading.Event()
+    subscribed = threading.Event()
+    subscription_mid = [None]
     received = []
     receive_event = threading.Event()
 
     def on_connect(inner, userdata, flags, reason_code, properties):
         _ = userdata, flags, properties
         if reason_code == 0:
-            inner.subscribe("/aicenter/data/#", qos=0)
-            connected.set()
+            result, mid = inner.subscribe(
+                [
+                    (Topics.BROKEN_CUP_IMAGE, 0),
+                    (Topics.BROKEN_CUP_VIDEO, 0),
+                    (Topics.COYOTE_IMAGE, 0),
+                    (Topics.COYOTE_VIDEO, 0),
+                ]
+            )
+            if result == 0:
+                subscription_mid[0] = mid
+
+    def on_subscribe(inner, userdata, mid, reason_code_list, properties):
+        _ = inner, userdata, properties
+        if mid != subscription_mid[0]:
+            return
+        if any(
+            bool(getattr(code, "is_failure", False))
+            or (isinstance(code, int) and code >= 128)
+            for code in reason_code_list
+        ):
+            return
+        subscribed.set()
 
     def on_message(inner, userdata, message):
         _ = inner, userdata
-        payload = json.loads(message.payload.decode("utf-8"))
+        try:
+            payload = json.loads(message.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(
+                "ignored invalid JSON topic={}: {}".format(message.topic, exc),
+                file=sys.stderr,
+            )
+            return
         received.append((str(message.topic), payload))
         print(json.dumps({"topic": message.topic, "payload": _summary(payload)}))
         receive_event.set()
 
     client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
     client.on_message = on_message
     client.connect(args.broker_host, args.broker_port, keepalive=30)
     client.loop_start()
     try:
-        if not connected.wait(timeout=5.0):
-            raise TimeoutError("sample peer could not connect to broker")
+        if not subscribed.wait(timeout=5.0):
+            raise TimeoutError("sample peer did not receive a successful MQTT SUBACK")
         if args.command == "listen":
             time.sleep(args.timeout_sec)
             return 0
         if args.command == "scenario":
-            return _scenario(client, received, receive_event, args.timeout_sec)
+            return _scenario(
+                client,
+                received,
+                receive_event,
+                args.timeout_sec,
+                include_patrol_start=args.allow_patrol_start,
+            )
         topic, payload = _message(args.command)
         _publish(client, topic, payload)
         print(json.dumps({"published": topic, "payload": payload}))
@@ -88,8 +141,15 @@ def main(argv=None) -> int:
         client.loop_stop()
 
 
-def _scenario(client, received, receive_event, timeout_sec: float) -> int:
-    for command in ("patrol-start", "sound", "coyote"):
+def _scenario(
+    client,
+    received,
+    receive_event,
+    timeout_sec: float,
+    *,
+    include_patrol_start: bool = False,
+) -> int:
+    for command in _scenario_commands(include_patrol_start):
         topic, payload = _message(command)
         _publish(client, topic, payload)
     expected = {
@@ -104,9 +164,6 @@ def _scenario(client, received, receive_event, timeout_sec: float) -> int:
             break
         receive_event.clear()
         receive_event.wait(timeout=0.2)
-    stop_topic, stop_payload = _message("patrol-stop")
-    _publish(client, stop_topic, stop_payload)
-
     topics = [topic for topic, _ in received]
     if not expected.issubset(set(topics)):
         print(json.dumps({"scenario": "FAIL", "missing_topics": sorted(expected - set(topics))}))
@@ -119,8 +176,27 @@ def _scenario(client, received, receive_event, timeout_sec: float) -> int:
         return 1
     _validate_event_pair(received, Topics.BROKEN_CUP_IMAGE, Topics.BROKEN_CUP_VIDEO)
     _validate_event_pair(received, Topics.COYOTE_IMAGE, Topics.COYOTE_VIDEO)
-    print(json.dumps({"scenario": "PASS", "received_topics": topics}))
+    print(
+        json.dumps(
+            {
+                "scenario": "PASS",
+                "patrol_start_sent": include_patrol_start,
+                "received_topics": topics,
+            }
+        )
+    )
     return 0
+
+
+def _scenario_commands(include_patrol_start: bool):
+    commands = ["sound", "coyote"]
+    if include_patrol_start:
+        commands.insert(0, "patrol-start")
+    return commands
+
+
+def _requires_motion_authorization(command: str) -> bool:
+    return command in {"patrol-start", "patrol-return-home", "patrol-reset"}
 
 
 def _message(command):
@@ -157,6 +233,8 @@ def _publish(client, topic, payload) -> None:
         qos=0,
         retain=False,
     )
+    if info.rc != 0:
+        raise RuntimeError("sample MQTT publish failed topic={} rc={}".format(topic, info.rc))
     info.wait_for_publish(timeout=5.0)
     if not info.is_published():
         raise TimeoutError("sample MQTT publish timed out topic={}".format(topic))

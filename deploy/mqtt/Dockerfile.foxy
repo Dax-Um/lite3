@@ -3,19 +3,25 @@ FROM iq9-lite3-ros-foxy:latest
 USER root
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    ROS_DOMAIN_ID=0 \
+    ROS_LOCALHOST_ONLY=0 \
+    RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-ugly \
         openssh-client \
         python3-pil \
+        ros-foxy-pointcloud-to-laserscan \
+        ros-foxy-rmw-cyclonedds-cpp \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.foxy.txt /tmp/lite3-mqtt-requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/lite3-mqtt-requirements.txt
 
 COPY hdl_localization /tmp/lite3_overlay_src/src/hdl_localization
+COPY lite3_bringup /tmp/lite3_overlay_src/src/lite3_bringup
 RUN . /opt/ros/foxy/setup.sh \
     && cd /tmp/lite3_overlay_src \
     && colcon build --install-base /opt/lite3_overlay \

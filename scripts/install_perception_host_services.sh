@@ -42,6 +42,10 @@ perception_host_start_mapping.sh
 perception_host_finish_mapping.sh
 perception_host_start_navigation.sh
 perception_host_stop_navigation.sh
+perception_host_start_watchdog.sh
+perception_host_prepare_nav_config.py
+perception_host_probe_lidar.py
+run_nav_watchdog.py
 "
 
 SERVICES="
@@ -61,7 +65,7 @@ if [ "$MODE" = "dry-run" ]; then
   for service in $SERVICES; do
     echo "copy: deploy/systemd/perception-host/$service -> $SYSTEMD_DIR/$service"
   done
-  echo "remote command: chmod +x $REMOTE_ROOT/scripts/perception_host_*.sh"
+  echo "remote command: chmod +x installed wrappers and helpers"
   echo "remote command: sudo systemctl daemon-reload"
   echo "not enabling or starting services automatically"
   exit 0
@@ -71,7 +75,7 @@ ssh "$HOST" "mkdir -p '$REMOTE_ROOT/scripts'"
 for wrapper in $WRAPPERS; do
   scp "$SCRIPT_DIR/$wrapper" "$HOST:$REMOTE_ROOT/scripts/$wrapper"
 done
-ssh "$HOST" "chmod +x '$REMOTE_ROOT'/scripts/perception_host_*.sh"
+ssh "$HOST" "chmod +x '$REMOTE_ROOT'/scripts/perception_host_*.sh '$REMOTE_ROOT'/scripts/perception_host_prepare_nav_config.py '$REMOTE_ROOT'/scripts/perception_host_probe_lidar.py '$REMOTE_ROOT'/scripts/run_nav_watchdog.py"
 
 for service in $SERVICES; do
   scp "$SERVICE_SRC/$service" "$HOST:/tmp/$service"

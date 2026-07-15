@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run gated LiDAR auto patrol with real ROS2 sensors and UDP output."""
 
+from __future__ import annotations
+
 import argparse
 import subprocess
 import sys

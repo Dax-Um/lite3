@@ -1,5 +1,7 @@
 """Command freshness watchdog."""
 
+from __future__ import annotations
+
 TIME_EPSILON = 1e-9
 
 

@@ -1,5 +1,7 @@
 """Runtime preflight guards shared by real-robot entrypoints."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from lite3_common.config import NETWORK_CONFIG_PATH, SAFETY_LIMITS_CONFIG_PATH, resolve_workspace_root

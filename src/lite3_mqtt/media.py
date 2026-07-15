@@ -41,7 +41,7 @@ class DetectionMediaPublisher:
     def __init__(
         self,
         *,
-        media_source: AnnotatedMediaSource,
+        media_source: Optional[AnnotatedMediaSource],
         publish_json: PublishJson,
         duration_ms: int = 5000,
         clock_ms: Optional[Callable[[], int]] = None,
@@ -61,6 +61,8 @@ class DetectionMediaPublisher:
         *,
         event_id: Optional[str] = None,
     ) -> str:
+        if self.media_source is None:
+            raise RuntimeError("publish_detection requires an annotated media source")
         event_id = event_id or f"{detection_type.value.lower()}-{uuid.uuid4().hex}"
 
         try:
@@ -68,14 +70,7 @@ class DetectionMediaPublisher:
         except Exception:
             self.logger.exception("annotated image capture failed event_id=%s", event_id)
             jpeg = None
-        image_kwargs = {
-            "event_id": event_id,
-            "detection_type": detection_type,
-            "jpeg_bytes": jpeg,
-        }
-        if self.clock_ms is not None:
-            image_kwargs["clock_ms"] = self.clock_ms
-        self.publish_json(image_topic(detection_type), build_image_payload(**image_kwargs))
+        self.publish_image(detection_type, event_id=event_id, jpeg_bytes=jpeg)
 
         try:
             mp4 = self.media_source.capture_video(
@@ -86,16 +81,50 @@ class DetectionMediaPublisher:
         except Exception:
             self.logger.exception("annotated video capture failed event_id=%s", event_id)
             mp4 = None
+        self.publish_video(
+            detection_type,
+            event_id=event_id,
+            mp4_bytes=mp4,
+            duration_ms=self.duration_ms,
+        )
+        return event_id
+
+    def publish_image(
+        self,
+        detection_type: DetectionType,
+        *,
+        event_id: str,
+        jpeg_bytes: Optional[bytes],
+    ) -> None:
+        """Publish one already-produced image without invoking the mock source."""
+        image_kwargs = {
+            "event_id": event_id,
+            "detection_type": detection_type,
+            "jpeg_bytes": jpeg_bytes,
+        }
+        if self.clock_ms is not None:
+            image_kwargs["clock_ms"] = self.clock_ms
+        self.publish_json(image_topic(detection_type), build_image_payload(**image_kwargs))
+
+    def publish_video(
+        self,
+        detection_type: DetectionType,
+        *,
+        event_id: str,
+        mp4_bytes: Optional[bytes],
+        duration_ms: Optional[int] = None,
+    ) -> None:
+        """Publish one already-produced clip using the existing MQTT contract."""
+        actual_duration_ms = self.duration_ms if duration_ms is None else duration_ms
         video_kwargs = {
             "event_id": event_id,
             "detection_type": detection_type,
-            "mp4_bytes": mp4,
-            "duration_ms": self.duration_ms,
+            "mp4_bytes": mp4_bytes,
+            "duration_ms": actual_duration_ms,
         }
         if self.clock_ms is not None:
             video_kwargs["clock_ms"] = self.clock_ms
         self.publish_json(video_topic(detection_type), build_video_payload(**video_kwargs))
-        return event_id
 
 
 class MockAnnotatedMediaSource:

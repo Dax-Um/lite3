@@ -5,6 +5,8 @@ core controller wiring can be unit-tested on non-target machines. The target
 runtime can wrap ``PatrolRosBridge`` in an actual ROS2 node.
 """
 
+from __future__ import annotations
+
 from lite3_behavior.patrol_controller import ControllerOutput, PatrolController
 from lite3_ros.lidar_adapter import scan_to_boundary_input
 from lite3_ros.odom_adapter import odom_to_pose2d

@@ -87,7 +87,7 @@ def test_velocity_clamp_applies_when_safe():
 
     cmd, reason = safety_filter.filter_cmd(Twist2D(9.0, -9.0, 9.0), now=10.0)
 
-    assert cmd == pytest.approx(Twist2D(0.10, -0.05, 0.20))
+    assert (cmd.vx, cmd.vy, cmd.wz) == pytest.approx((0.10, -0.05, 0.20))
     assert reason is StopReason.NONE
 
 

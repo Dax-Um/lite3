@@ -11,7 +11,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 from lite3_perception.udp_camera_receiver import (
     CameraFrame,
@@ -22,7 +22,7 @@ from lite3_perception.udp_camera_receiver import (
 
 
 FrameCallback = Callable[[CameraFrame], None]
-StatsCallback = Callable[[dict[str, Any]], None]
+StatsCallback = Callable[[Dict[str, Any]], None]
 
 
 @dataclass(frozen=True)

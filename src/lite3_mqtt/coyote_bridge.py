@@ -1,0 +1,1253 @@
+"""ROS-facing coyote status and durable media bridge core."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import os
+import queue
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, Iterable, Optional, Protocol, Set, Tuple, Union
+
+from lite3_mqtt.contract import DetectionType, PatrolAction, decode_object
+from lite3_perception.coyote_spool import validate_event_id
+
+
+COYOTE_STATUS_TIMEOUT_SEC = 1.0
+COYOTE_FORWARD_SPEED_MPS = 1.00
+COYOTE_SEARCH_ADVANCE_SPEED_MPS = 0.05
+COYOTE_CONTROL_HZ = 20.0
+COYOTE_TURN_SPEED_RADPS = 0.60  # Detected target alignment: 2x previous speed.
+COYOTE_SEARCH_TURN_SPEED_RADPS = 1.35  # Search only: 2x previous speed.
+COYOTE_TURN_STEP_SEC = 0.25
+COYOTE_TURN_PAUSE_SEC = 0.10
+COYOTE_SEARCH_SWEEP_RAD = 2.0 * math.pi
+COYOTE_SEARCH_ADVANCE_M = 0.50
+COYOTE_SENSOR_TIMEOUT_SEC = 0.50
+COYOTE_TURN_CLEARANCE_M = 0.45
+COYOTE_FORWARD_CLEARANCE_M = 0.70
+COYOTE_PROGRESS_TIMEOUT_SEC = 2.0
+COYOTE_ALIGN_TIMEOUT_SEC = 15.0
+COYOTE_SEARCH_TURN_TIMEOUT_SEC = 90.0
+COYOTE_SEARCH_ADVANCE_TIMEOUT_SEC = 20.0
+COYOTE_TRACK_FORWARD_TIMEOUT_SEC = 60.0
+COYOTE_SEARCH_SESSION_TIMEOUT_SEC = 180.0
+COYOTE_PROGRESS_DISTANCE_M = 0.02
+COYOTE_PROGRESS_YAW_RAD = 0.03
+COYOTE_ADVANCE_LATERAL_TOLERANCE_M = 0.05
+COYOTE_ADVANCE_YAW_TOLERANCE_RAD = 0.10
+
+
+@dataclass(frozen=True)
+class CoyoteStatus:
+    timestamp_sec: float
+    detect: str
+    motion: str
+    side: str
+
+
+def parse_coyote_status(payload: Union[bytes, str]) -> CoyoteStatus:
+    value = decode_object(payload)
+    timestamp = value.get("ts")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        raise ValueError("coyote ts must be a Unix-seconds JSON number")
+    timestamp = float(timestamp)
+    if not math.isfinite(timestamp) or timestamp <= 0.0:
+        raise ValueError("coyote ts must be finite and positive")
+
+    detect = _enum_string(value, "detect", ("detected", "not_detected"))
+    motion = _enum_string(value, "motion", ("forward", "stop"))
+    side = _enum_string(value, "side", ("center", "left", "right", "none"))
+    if detect == "not_detected" and (motion != "stop" or side != "none"):
+        raise ValueError("not_detected status must use motion=stop and side=none")
+    if detect == "detected" and motion == "forward" and side != "center":
+        raise ValueError("detected forward status must use side=center")
+    if detect == "detected" and motion == "stop" and side == "none":
+        raise ValueError("detected stop status must identify center, left, or right")
+    return CoyoteStatus(
+        timestamp_sec=timestamp,
+        detect=detect,
+        motion=motion,
+        side=side,
+    )
+
+
+class MotionSink(Protocol):
+    def acquire(self) -> None:
+        ...
+
+    def send_cmd_vel(self, vx: float, vy: float, wz: float) -> None:
+        ...
+
+    def release(self) -> None:
+        ...
+
+
+class CoyoteMotionController:
+    """Execute the four-field status contract with a bounded search sequence."""
+
+    def __init__(
+        self,
+        motion_sink: MotionSink,
+        *,
+        forward_speed_mps: float = COYOTE_FORWARD_SPEED_MPS,
+        turn_speed_radps: float = COYOTE_TURN_SPEED_RADPS,
+        search_turn_speed_radps: float = COYOTE_SEARCH_TURN_SPEED_RADPS,
+        turn_step_sec: float = COYOTE_TURN_STEP_SEC,
+        turn_pause_sec: float = COYOTE_TURN_PAUSE_SEC,
+        search_sweep_rad: float = COYOTE_SEARCH_SWEEP_RAD,
+        search_advance_m: float = COYOTE_SEARCH_ADVANCE_M,
+        search_advance_speed_mps: float = COYOTE_SEARCH_ADVANCE_SPEED_MPS,
+        sensor_timeout_sec: float = COYOTE_SENSOR_TIMEOUT_SEC,
+        turn_clearance_m: float = COYOTE_TURN_CLEARANCE_M,
+        forward_clearance_m: float = COYOTE_FORWARD_CLEARANCE_M,
+        progress_timeout_sec: float = COYOTE_PROGRESS_TIMEOUT_SEC,
+        align_timeout_sec: float = COYOTE_ALIGN_TIMEOUT_SEC,
+        search_turn_timeout_sec: float = COYOTE_SEARCH_TURN_TIMEOUT_SEC,
+        search_advance_timeout_sec: float = COYOTE_SEARCH_ADVANCE_TIMEOUT_SEC,
+        track_forward_timeout_sec: float = COYOTE_TRACK_FORWARD_TIMEOUT_SEC,
+        search_session_timeout_sec: float = COYOTE_SEARCH_SESSION_TIMEOUT_SEC,
+        progress_distance_m: float = COYOTE_PROGRESS_DISTANCE_M,
+        progress_yaw_rad: float = COYOTE_PROGRESS_YAW_RAD,
+        advance_lateral_tolerance_m: float = COYOTE_ADVANCE_LATERAL_TOLERANCE_M,
+        advance_yaw_tolerance_rad: float = COYOTE_ADVANCE_YAW_TOLERANCE_RAD,
+        timeout_sec: float = COYOTE_STATUS_TIMEOUT_SEC,
+        wall_clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        ready: Callable[[], bool] = lambda: True,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        if not math.isfinite(forward_speed_mps) or forward_speed_mps <= 0.0:
+            raise ValueError("forward_speed_mps must be finite and positive")
+        if not math.isfinite(turn_speed_radps) or turn_speed_radps <= 0.0:
+            raise ValueError("turn_speed_radps must be finite and positive")
+        if (
+            not math.isfinite(search_turn_speed_radps)
+            or search_turn_speed_radps <= 0.0
+        ):
+            raise ValueError(
+                "search_turn_speed_radps must be finite and positive"
+            )
+        if min(turn_step_sec, turn_pause_sec, search_sweep_rad) <= 0.0:
+            raise ValueError("turn timing and search sweep must be positive")
+        if not math.isfinite(search_advance_m) or search_advance_m <= 0.0:
+            raise ValueError("search_advance_m must be finite and positive")
+        if (
+            not math.isfinite(search_advance_speed_mps)
+            or search_advance_speed_mps <= 0.0
+        ):
+            raise ValueError("search_advance_speed_mps must be finite and positive")
+        if min(sensor_timeout_sec, turn_clearance_m, forward_clearance_m) <= 0.0:
+            raise ValueError("sensor timeout and clearances must be positive")
+        if min(
+            progress_timeout_sec,
+            align_timeout_sec,
+            search_turn_timeout_sec,
+            search_advance_timeout_sec,
+            track_forward_timeout_sec,
+            search_session_timeout_sec,
+            progress_distance_m,
+            progress_yaw_rad,
+            advance_lateral_tolerance_m,
+            advance_yaw_tolerance_rad,
+        ) <= 0.0:
+            raise ValueError("motion watchdog values must be positive")
+        if not math.isfinite(timeout_sec) or timeout_sec <= 0.0:
+            raise ValueError("timeout_sec must be finite and positive")
+        self.motion_sink = motion_sink
+        self.forward_speed_mps = forward_speed_mps
+        self.turn_speed_radps = turn_speed_radps
+        self.search_turn_speed_radps = search_turn_speed_radps
+        self.turn_step_sec = turn_step_sec
+        self.turn_pause_sec = turn_pause_sec
+        self.search_sweep_rad = search_sweep_rad
+        self.search_advance_m = search_advance_m
+        self.search_advance_speed_mps = search_advance_speed_mps
+        self.sensor_timeout_sec = sensor_timeout_sec
+        self.turn_clearance_m = turn_clearance_m
+        self.forward_clearance_m = forward_clearance_m
+        self.progress_timeout_sec = progress_timeout_sec
+        self.align_timeout_sec = align_timeout_sec
+        self.search_turn_timeout_sec = search_turn_timeout_sec
+        self.search_advance_timeout_sec = search_advance_timeout_sec
+        self.track_forward_timeout_sec = track_forward_timeout_sec
+        self.search_session_timeout_sec = search_session_timeout_sec
+        self.progress_distance_m = progress_distance_m
+        self.progress_yaw_rad = progress_yaw_rad
+        self.advance_lateral_tolerance_m = advance_lateral_tolerance_m
+        self.advance_yaw_tolerance_rad = advance_yaw_tolerance_rad
+        self.timeout_sec = timeout_sec
+        self.wall_clock = wall_clock
+        self.monotonic_clock = monotonic_clock
+        self.ready = ready
+        self.logger = logger or logging.getLogger(__name__)
+        self._lock = threading.Lock()
+        self._status = None  # type: Optional[CoyoteStatus]
+        self._status_type = None  # type: Optional[DetectionType]
+        self._synthetic_search_status = False
+        self._received_at = None  # type: Optional[float]
+        self._last_reason = "no_status"
+        self._scan_received_at = None  # type: Optional[float]
+        self._left_clearance_m = None  # type: Optional[float]
+        self._right_clearance_m = None  # type: Optional[float]
+        self._front_clearance_m = None  # type: Optional[float]
+        self._odom_received_at = None  # type: Optional[float]
+        self._odom_xy = None  # type: Optional[Tuple[float, float]]
+        self._odom_yaw = None  # type: Optional[float]
+        self._search_armed = False
+        self._search_started_at = None  # type: Optional[float]
+        self._active_detection_type = None  # type: Optional[DetectionType]
+        self._emergency_latched = False
+        self._operator_stop_latched = False
+        self._search_phase = "idle"
+        self._search_direction = -1
+        self._sweep_angle_rad = 0.0
+        self._last_sweep_yaw = None  # type: Optional[float]
+        self._search_turn_active = False
+        self._advance_start_xy = None  # type: Optional[Tuple[float, float]]
+        self._advance_start_yaw = None  # type: Optional[float]
+        self._advance_completed = False
+        self._pulse_direction = 0
+        self._pulse_active_until = 0.0
+        self._pulse_pause_until = 0.0
+        self._recent_events = deque(maxlen=256)  # type: Deque[str]
+        self._recent_event_set = set()  # type: Set[str]
+        self._recent_patrol_commands = deque(maxlen=64)  # type: Deque[Tuple[int, str]]
+        self._recent_patrol_command_set = set()  # type: Set[Tuple[int, str]]
+        self._last_patrol_timestamp = None  # type: Optional[int]
+        self._motion_key = None  # type: Optional[Tuple[str, int]]
+        self._motion_started_at = None  # type: Optional[float]
+        self._motion_progress_at = None  # type: Optional[float]
+        self._motion_progress_xy = None  # type: Optional[Tuple[float, float]]
+        self._motion_progress_yaw = None  # type: Optional[float]
+
+    @property
+    def last_reason(self) -> str:
+        with self._lock:
+            return self._last_reason
+
+    @property
+    def emergency_latched(self) -> bool:
+        with self._lock:
+            return self._emergency_latched
+
+    def handle_status(
+        self,
+        payload: Union[bytes, str],
+        detection_type: DetectionType = DetectionType.COYOTE,
+    ) -> CoyoteStatus:
+        try:
+            detection_type = DetectionType(detection_type)
+        except ValueError as exc:
+            raise ValueError("unsupported coyote status detection type") from exc
+        try:
+            status = parse_coyote_status(payload)
+        except Exception:
+            with self._lock:
+                if (
+                    self._search_armed
+                    and self._active_detection_type is not detection_type
+                ):
+                    raise
+                self._status = None
+                self._status_type = None
+                self._synthetic_search_status = False
+                self._received_at = None
+                self._search_armed = False
+                self._search_started_at = None
+                self._active_detection_type = None
+                self._search_phase = "idle"
+                self._search_turn_active = False
+                self._reset_motion_guard_locked()
+                self._last_reason = "invalid_status"
+                self._send_stop()
+                self._release_output_locked()
+            raise
+
+        now_wall = self.wall_clock()
+        now_monotonic = self.monotonic_clock()
+        reason = self._status_reason(status, now_wall, 0.0)
+        with self._lock:
+            if (
+                self._search_armed
+                and self._active_detection_type is not detection_type
+            ):
+                return status
+            self._status = status
+            self._status_type = detection_type
+            self._synthetic_search_status = False
+            self._received_at = now_monotonic
+            self._last_reason = reason
+            needs_target_motion = (
+                status.detect == "detected"
+                and (
+                    status.motion == "forward"
+                    or status.side in {"left", "right"}
+                )
+            )
+            if (
+                needs_target_motion
+                and not self._search_armed
+                and not self._emergency_latched
+                and not self._operator_stop_latched
+            ):
+                acquire = getattr(self.motion_sink, "acquire", None)
+                if callable(acquire):
+                    acquire()
+                self._search_armed = True
+                self._search_started_at = now_monotonic
+                self._active_detection_type = detection_type
+                self._search_phase = "idle"
+                self._search_turn_active = False
+                self._advance_completed = False
+                self._reset_pulse_locked()
+                self._send_stop()
+            # A stop advisory is applied in this callback. Turning, if any,
+            # starts on a later control tick so a zero command always separates
+            # forward motion from rotation.
+            if status.motion == "stop" or reason != "forward":
+                self._send_stop()
+        return status
+
+    def start_search(
+        self,
+        event_id: str,
+        detection_type: DetectionType = DetectionType.COYOTE,
+    ) -> bool:
+        if not isinstance(event_id, str) or not event_id or len(event_id) > 128:
+            raise ValueError("search event_id must be a non-empty string up to 128 chars")
+        try:
+            detection_type = DetectionType(detection_type)
+        except ValueError as exc:
+            raise ValueError("unsupported search detection type") from exc
+        with self._lock:
+            if self._emergency_latched:
+                self._last_reason = "emergency_latched"
+                return False
+            if event_id in self._recent_event_set:
+                return False
+            if len(self._recent_events) == self._recent_events.maxlen:
+                evicted = self._recent_events.popleft()
+                self._recent_event_set.discard(evicted)
+            self._recent_events.append(event_id)
+            self._recent_event_set.add(event_id)
+            if self._search_armed:
+                self._last_reason = "search_trigger_coalesced"
+                return False
+            self._operator_stop_latched = False
+            acquire = getattr(self.motion_sink, "acquire", None)
+            if callable(acquire):
+                acquire()
+            self._search_armed = True
+            self._active_detection_type = detection_type
+            now_wall = self.wall_clock()
+            now_monotonic = self.monotonic_clock()
+            self._search_started_at = now_monotonic
+            status_is_fresh = (
+                self._status is not None
+                and self._status_type is detection_type
+                and not self._synthetic_search_status
+                and self._received_at is not None
+                and abs(now_wall - self._status.timestamp_sec) <= self.timeout_sec
+                and 0.0 <= now_monotonic - self._received_at <= self.timeout_sec
+            )
+            if not status_is_fresh:
+                self._status = CoyoteStatus(
+                    timestamp_sec=now_wall,
+                    detect="not_detected",
+                    motion="stop",
+                    side="none",
+                )
+                self._status_type = detection_type
+                self._received_at = now_monotonic
+                self._synthetic_search_status = True
+            else:
+                self._synthetic_search_status = False
+            self._advance_completed = False
+            self._begin_scan_locked(direction=-1, phase="primary_turn")
+            self._last_reason = "search_triggered"
+            self._send_stop()
+        return True
+
+    def handle_patrol_command(
+        self,
+        action: PatrolAction,
+        timestamp: int,
+    ) -> bool:
+        """Apply the MQTT patrol command ordering rules to search ownership."""
+        try:
+            action = PatrolAction(action)
+        except ValueError as exc:
+            raise ValueError("unsupported patrol action") from exc
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:
+            raise ValueError("patrol timestamp must be a positive epoch-millisecond integer")
+
+        key = (timestamp, action.value)
+        with self._lock:
+            if key in self._recent_patrol_command_set:
+                return False
+            if (
+                action in {
+                    PatrolAction.START,
+                    PatrolAction.RETURN_HOME,
+                    PatrolAction.RESET,
+                }
+                and self._last_patrol_timestamp is not None
+                and timestamp <= self._last_patrol_timestamp
+            ):
+                self.logger.warning(
+                    "out-of-order coyote patrol command ignored action=%s timestamp=%s last=%s",
+                    action.value,
+                    timestamp,
+                    self._last_patrol_timestamp,
+                )
+                return False
+            if len(self._recent_patrol_commands) == self._recent_patrol_commands.maxlen:
+                evicted = self._recent_patrol_commands.popleft()
+                self._recent_patrol_command_set.discard(evicted)
+            self._recent_patrol_commands.append(key)
+            self._recent_patrol_command_set.add(key)
+            if self._last_patrol_timestamp is None:
+                self._last_patrol_timestamp = timestamp
+            else:
+                self._last_patrol_timestamp = max(
+                    self._last_patrol_timestamp,
+                    timestamp,
+                )
+
+            if action is PatrolAction.EMERGENCY_STOP:
+                self._emergency_latched = True
+                self._operator_stop_latched = True
+                self._stop_locked("emergency_stop")
+            elif action is PatrolAction.RESET:
+                self._stop_locked("reset")
+                self._emergency_latched = False
+                self._operator_stop_latched = False
+            elif action is PatrolAction.START:
+                self._operator_stop_latched = False
+                self._stop_locked("patrol_start")
+            else:
+                self._operator_stop_latched = True
+                self._stop_locked("patrol_{}".format(action.value.lower()))
+        return True
+
+    def update_scan(
+        self,
+        ranges: Iterable[float],
+        angle_min: float,
+        angle_increment: float,
+    ) -> None:
+        if not math.isfinite(angle_min) or not math.isfinite(angle_increment):
+            raise ValueError("scan angles must be finite")
+        if angle_increment == 0.0:
+            raise ValueError("scan angle_increment must be non-zero")
+        left = []
+        right = []
+        front = []
+        for index, raw_range in enumerate(ranges):
+            try:
+                distance = float(raw_range)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(distance) or distance <= 0.0:
+                continue
+            angle = _normalize_angle(angle_min + index * angle_increment)
+            # Include the rear leading quadrant swept by a rectangular body
+            # during each turn, not only the camera-facing side sector.
+            if (
+                math.radians(15.0) <= angle <= math.radians(135.0)
+                or math.radians(-180.0) <= angle <= math.radians(-105.0)
+            ):
+                left.append(distance)
+            if (
+                math.radians(-135.0) <= angle <= math.radians(-15.0)
+                or math.radians(105.0) <= angle <= math.radians(180.0)
+            ):
+                right.append(distance)
+            if abs(angle) <= math.radians(20.0):
+                front.append(distance)
+        with self._lock:
+            self._left_clearance_m = min(left) if left else None
+            self._right_clearance_m = min(right) if right else None
+            self._front_clearance_m = min(front) if front else None
+            self._scan_received_at = self.monotonic_clock()
+
+    def update_odom(self, x: float, y: float, yaw: float) -> None:
+        if not all(math.isfinite(value) for value in (x, y, yaw)):
+            raise ValueError("odom pose must be finite")
+        now = self.monotonic_clock()
+        yaw = _normalize_angle(yaw)
+        with self._lock:
+            if (
+                self._search_phase in {"primary_turn", "secondary_turn"}
+                and self._search_turn_active
+            ):
+                if self._last_sweep_yaw is not None:
+                    delta = _normalize_angle(yaw - self._last_sweep_yaw)
+                    self._sweep_angle_rad += max(
+                        0.0,
+                        delta * self._search_direction,
+                    )
+                self._last_sweep_yaw = yaw
+            if self._motion_key is not None:
+                kind = self._motion_key[0]
+                progressed = False
+                if kind in {"align", "search_turn"}:
+                    if self._motion_progress_yaw is None:
+                        self._motion_progress_yaw = yaw
+                    elif abs(
+                        _normalize_angle(yaw - self._motion_progress_yaw)
+                    ) >= self.progress_yaw_rad:
+                        self._motion_progress_yaw = yaw
+                        progressed = True
+                elif kind in {"search_advance", "track_forward"}:
+                    if self._motion_progress_xy is None:
+                        self._motion_progress_xy = (float(x), float(y))
+                    elif math.hypot(
+                        float(x) - self._motion_progress_xy[0],
+                        float(y) - self._motion_progress_xy[1],
+                    ) >= self.progress_distance_m:
+                        self._motion_progress_xy = (float(x), float(y))
+                        progressed = True
+                if progressed:
+                    self._motion_progress_at = now
+            self._odom_xy = (float(x), float(y))
+            self._odom_yaw = yaw
+            self._odom_received_at = now
+
+    def tick(self) -> Tuple[float, float, float]:
+        now_wall = self.wall_clock()
+        now_monotonic = self.monotonic_clock()
+        with self._lock:
+            if self._search_armed and self._synthetic_search_status:
+                self._status = CoyoteStatus(
+                    timestamp_sec=now_wall,
+                    detect="not_detected",
+                    motion="stop",
+                    side="none",
+                )
+                self._received_at = now_monotonic
+            status = self._status
+            received_at = self._received_at
+            receive_age = math.inf if received_at is None else now_monotonic - received_at
+            reason = self._status_reason(status, now_wall, receive_age)
+            if (
+                self._search_armed
+                and self._search_started_at is not None
+                and now_monotonic - self._search_started_at
+                > self.search_session_timeout_sec
+            ):
+                command, reason = self._abort_motion_locked(
+                    "search_session_timeout"
+                )
+            elif reason in {"forward", "motion_stop"} and not self._search_armed:
+                command = (0.0, 0.0, 0.0)
+                reason = "detection_not_armed"
+                self._search_turn_active = False
+                self._reset_pulse_locked()
+            elif reason == "forward":
+                if not self._scan_fresh_locked(now_monotonic):
+                    command = (0.0, 0.0, 0.0)
+                    reason = "lidar_stale"
+                elif not self._odom_fresh_locked(now_monotonic):
+                    command = (0.0, 0.0, 0.0)
+                    reason = "odom_stale"
+                elif not self._front_clear_locked():
+                    command = (0.0, 0.0, 0.0)
+                    reason = "forward_blocked"
+                else:
+                    command = (self.forward_speed_mps, 0.0, 0.0)
+                    self._search_turn_active = False
+                    self._reset_pulse_locked()
+            elif reason == "motion_stop" and status is not None:
+                command, reason = self._detected_stop_command_locked(
+                    status,
+                    now_monotonic,
+                )
+            elif reason == "not_detected" and self._search_armed:
+                command, reason = self._search_command_locked(now_monotonic)
+            else:
+                command = (0.0, 0.0, 0.0)
+                self._search_turn_active = False
+                self._reset_pulse_locked()
+                if reason in {"future_status", "stale_status"}:
+                    self._search_armed = False
+                    self._search_started_at = None
+                    self._active_detection_type = None
+                    self._search_phase = "idle"
+            command, reason = self._guard_motion_locked(
+                command,
+                reason,
+                now_monotonic,
+            )
+            try:
+                self.motion_sink.send_cmd_vel(*command)
+            except Exception:
+                try:
+                    self._send_stop()
+                finally:
+                    raise
+            self._last_reason = reason
+            if (
+                command == (0.0, 0.0, 0.0)
+                and not self._search_armed
+                and self._should_release_locked(reason)
+            ):
+                self._release_output_locked()
+        return command
+
+    def stop(self) -> None:
+        with self._lock:
+            self._operator_stop_latched = True
+            self._stop_locked("stopped")
+
+    def emergency_stop(self) -> None:
+        with self._lock:
+            self._emergency_latched = True
+            self._operator_stop_latched = True
+            self._stop_locked("emergency_stop")
+
+    def reset(self) -> None:
+        with self._lock:
+            self._stop_locked("reset")
+            self._emergency_latched = False
+            self._operator_stop_latched = False
+
+    def _stop_locked(self, reason: str) -> None:
+        self._status = None
+        self._status_type = None
+        self._synthetic_search_status = False
+        self._received_at = None
+        self._search_armed = False
+        self._search_started_at = None
+        self._active_detection_type = None
+        self._search_phase = "idle"
+        self._search_turn_active = False
+        self._reset_pulse_locked()
+        self._reset_motion_guard_locked()
+        self._last_reason = reason
+        self._send_stop()
+        self._release_output_locked()
+
+    def _status_reason(
+        self,
+        status: Optional[CoyoteStatus],
+        now_wall: float,
+        receive_age: float,
+    ) -> str:
+        try:
+            is_ready = bool(self.ready())
+        except Exception:
+            is_ready = False
+        if not is_ready:
+            return "transport_not_ready"
+        if status is None:
+            return "no_status"
+        payload_age = now_wall - status.timestamp_sec
+        if payload_age < -self.timeout_sec:
+            return "future_status"
+        if payload_age > self.timeout_sec or receive_age > self.timeout_sec:
+            return "stale_status"
+        if status.detect != "detected":
+            return "not_detected"
+        if status.motion != "forward":
+            return "motion_stop"
+        return "forward"
+
+    def _detected_stop_command_locked(
+        self,
+        status: CoyoteStatus,
+        now: float,
+    ) -> Tuple[Tuple[float, float, float], str]:
+        if status.side == "center":
+            self._search_armed = False
+            self._search_started_at = None
+            self._active_detection_type = None
+            self._search_phase = "idle"
+            self._search_turn_active = False
+            self._reset_pulse_locked()
+            return (0.0, 0.0, 0.0), "target_centered"
+        direction = 1 if status.side == "left" else -1
+        self._search_turn_active = False
+        if not self._scan_fresh_locked(now):
+            return (0.0, 0.0, 0.0), "lidar_stale"
+        if not self._odom_fresh_locked(now):
+            return (0.0, 0.0, 0.0), "odom_stale"
+        if not self._turn_clear_locked(direction):
+            self._reset_pulse_locked()
+            return (0.0, 0.0, 0.0), "target_side_blocked"
+        command = self._pulse_turn_locked(
+            direction,
+            now,
+            speed_radps=self.turn_speed_radps,
+        )
+        return command, "align_left" if direction > 0 else "align_right"
+
+    def _search_command_locked(
+        self,
+        now: float,
+    ) -> Tuple[Tuple[float, float, float], str]:
+        if not self._scan_fresh_locked(now):
+            return (0.0, 0.0, 0.0), "lidar_stale"
+        if not self._odom_fresh_locked(now):
+            return (0.0, 0.0, 0.0), "odom_stale"
+        if self._search_phase == "advance":
+            return self._advance_command_locked()
+        if self._search_phase not in {"primary_turn", "secondary_turn"}:
+            self._begin_scan_locked(direction=-1, phase="primary_turn")
+
+        direction = self._search_direction
+        if not self._turn_clear_locked(direction):
+            if self._search_phase == "primary_turn":
+                self._begin_scan_locked(direction=1, phase="secondary_turn")
+                return (0.0, 0.0, 0.0), "search_reverse"
+            self._search_armed = False
+            self._search_started_at = None
+            self._active_detection_type = None
+            self._search_phase = "idle"
+            return (0.0, 0.0, 0.0), "search_turn_blocked"
+
+        if self._sweep_angle_rad >= self.search_sweep_rad:
+            if self._advance_completed:
+                self._search_armed = False
+                self._search_started_at = None
+                self._active_detection_type = None
+                self._search_phase = "idle"
+                return (0.0, 0.0, 0.0), "search_exhausted"
+            self._search_phase = "advance"
+            self._advance_start_xy = None
+            self._search_turn_active = False
+            self._reset_pulse_locked()
+            return (0.0, 0.0, 0.0), "search_scan_complete"
+
+        was_turning = self._search_turn_active
+        command = self._pulse_turn_locked(
+            direction,
+            now,
+            speed_radps=self.search_turn_speed_radps,
+        )
+        self._search_turn_active = command[2] != 0.0
+        if self._search_turn_active and not was_turning:
+            self._last_sweep_yaw = self._odom_yaw
+        return command, "search_clockwise" if direction < 0 else "search_counterclockwise"
+
+    def _advance_command_locked(self) -> Tuple[Tuple[float, float, float], str]:
+        if self._odom_xy is None:
+            return (0.0, 0.0, 0.0), "odom_stale"
+        if self._advance_start_xy is None:
+            self._advance_start_xy = self._odom_xy
+            self._advance_start_yaw = self._odom_yaw
+        if self._advance_start_yaw is None or self._odom_yaw is None:
+            return (0.0, 0.0, 0.0), "odom_stale"
+        dx = self._odom_xy[0] - self._advance_start_xy[0]
+        dy = self._odom_xy[1] - self._advance_start_xy[1]
+        forward_distance = (
+            dx * math.cos(self._advance_start_yaw)
+            + dy * math.sin(self._advance_start_yaw)
+        )
+        lateral_distance = abs(
+            -dx * math.sin(self._advance_start_yaw)
+            + dy * math.cos(self._advance_start_yaw)
+        )
+        yaw_error = abs(_normalize_angle(self._odom_yaw - self._advance_start_yaw))
+        if (
+            forward_distance < -self.progress_distance_m
+            or lateral_distance > self.advance_lateral_tolerance_m
+            or yaw_error > self.advance_yaw_tolerance_rad
+        ):
+            self._search_armed = False
+            self._search_started_at = None
+            self._active_detection_type = None
+            self._search_phase = "idle"
+            return (0.0, 0.0, 0.0), "search_advance_deviated"
+        if forward_distance >= self.search_advance_m:
+            self._advance_completed = True
+            self._begin_scan_locked(direction=-1, phase="primary_turn")
+            return (0.0, 0.0, 0.0), "search_advance_complete"
+        if not self._front_clear_locked():
+            self._search_armed = False
+            self._search_started_at = None
+            self._active_detection_type = None
+            self._search_phase = "idle"
+            return (0.0, 0.0, 0.0), "search_advance_blocked"
+        return (self.search_advance_speed_mps, 0.0, 0.0), "search_advance"
+
+    def _begin_scan_locked(self, *, direction: int, phase: str) -> None:
+        self._search_phase = phase
+        self._search_direction = 1 if direction > 0 else -1
+        self._sweep_angle_rad = 0.0
+        self._last_sweep_yaw = self._odom_yaw
+        self._search_turn_active = False
+        self._advance_start_xy = None
+        self._advance_start_yaw = None
+        self._reset_pulse_locked()
+
+    def _pulse_turn_locked(
+        self,
+        direction: int,
+        now: float,
+        *,
+        speed_radps: float,
+    ) -> Tuple[float, float, float]:
+        direction = 1 if direction > 0 else -1
+        if direction != self._pulse_direction:
+            self._reset_pulse_locked()
+            self._pulse_direction = direction
+        if now < self._pulse_active_until:
+            return (0.0, 0.0, direction * speed_radps)
+        if now < self._pulse_pause_until:
+            return (0.0, 0.0, 0.0)
+        self._pulse_active_until = now + self.turn_step_sec
+        self._pulse_pause_until = self._pulse_active_until + self.turn_pause_sec
+        return (0.0, 0.0, direction * speed_radps)
+
+    def _reset_pulse_locked(self) -> None:
+        self._pulse_direction = 0
+        self._pulse_active_until = 0.0
+        self._pulse_pause_until = 0.0
+
+    def _guard_motion_locked(
+        self,
+        command: Tuple[float, float, float],
+        reason: str,
+        now: float,
+    ) -> Tuple[Tuple[float, float, float], str]:
+        key = self._motion_key_for_reason(reason)
+        moving = any(abs(value) > 1e-9 for value in command)
+        if not moving:
+            if key != self._motion_key:
+                self._reset_motion_guard_locked()
+            return command, reason
+        if key is None:
+            return self._abort_motion_locked("motion_reason_invalid")
+        if key != self._motion_key:
+            self._motion_key = key
+            self._motion_started_at = now
+            self._motion_progress_at = now
+            self._motion_progress_xy = self._odom_xy
+            self._motion_progress_yaw = self._odom_yaw
+
+        duration_limit = {
+            "align": self.align_timeout_sec,
+            "search_turn": self.search_turn_timeout_sec,
+            "search_advance": self.search_advance_timeout_sec,
+            "track_forward": self.track_forward_timeout_sec,
+        }[key[0]]
+        if (
+            self._motion_started_at is None
+            or now - self._motion_started_at > duration_limit
+        ):
+            return self._abort_motion_locked("motion_phase_timeout")
+        if (
+            self._motion_progress_at is None
+            or now - self._motion_progress_at > self.progress_timeout_sec
+        ):
+            return self._abort_motion_locked("motion_progress_timeout")
+        return command, reason
+
+    @staticmethod
+    def _motion_key_for_reason(reason: str) -> Optional[Tuple[str, int]]:
+        if reason == "align_left":
+            return ("align", 1)
+        if reason == "align_right":
+            return ("align", -1)
+        if reason == "search_clockwise":
+            return ("search_turn", -1)
+        if reason == "search_counterclockwise":
+            return ("search_turn", 1)
+        if reason == "search_advance":
+            return ("search_advance", 0)
+        if reason == "forward":
+            return ("track_forward", 0)
+        return None
+
+    def _abort_motion_locked(
+        self,
+        reason: str,
+    ) -> Tuple[Tuple[float, float, float], str]:
+        self._search_armed = False
+        self._search_started_at = None
+        self._active_detection_type = None
+        self._search_phase = "idle"
+        self._search_turn_active = False
+        self._reset_pulse_locked()
+        self._reset_motion_guard_locked()
+        return (0.0, 0.0, 0.0), reason
+
+    def _reset_motion_guard_locked(self) -> None:
+        self._motion_key = None
+        self._motion_started_at = None
+        self._motion_progress_at = None
+        self._motion_progress_xy = None
+        self._motion_progress_yaw = None
+
+    def _scan_fresh_locked(self, now: float) -> bool:
+        return (
+            self._scan_received_at is not None
+            and 0.0 <= now - self._scan_received_at <= self.sensor_timeout_sec
+        )
+
+    def _odom_fresh_locked(self, now: float) -> bool:
+        return (
+            self._odom_received_at is not None
+            and 0.0 <= now - self._odom_received_at <= self.sensor_timeout_sec
+        )
+
+    def _turn_clear_locked(self, direction: int) -> bool:
+        clearance = self._left_clearance_m if direction > 0 else self._right_clearance_m
+        return clearance is not None and clearance >= self.turn_clearance_m
+
+    def _front_clear_locked(self) -> bool:
+        return (
+            self._front_clearance_m is not None
+            and self._front_clearance_m >= self.forward_clearance_m
+        )
+
+    @staticmethod
+    def _should_release_locked(reason: str) -> bool:
+        return reason in {
+            "future_status",
+            "invalid_status",
+            "lidar_stale",
+            "motion_phase_timeout",
+            "motion_progress_timeout",
+            "motion_reason_invalid",
+            "no_status",
+            "not_detected",
+            "odom_stale",
+            "search_advance_blocked",
+            "search_advance_deviated",
+            "search_exhausted",
+            "search_session_timeout",
+            "search_turn_blocked",
+            "stale_status",
+            "stopped",
+            "target_centered",
+            "transport_not_ready",
+        }
+
+    def _release_output_locked(self) -> None:
+        release = getattr(self.motion_sink, "release", None)
+        if callable(release):
+            release()
+
+    def _send_stop(self) -> None:
+        self.motion_sink.send_cmd_vel(0.0, 0.0, 0.0)
+
+
+class MediaPublisher(Protocol):
+    def publish_image(
+        self,
+        detection_type: DetectionType,
+        *,
+        event_id: str,
+        jpeg_bytes: Optional[bytes],
+    ) -> None:
+        ...
+
+    def publish_video(
+        self,
+        detection_type: DetectionType,
+        *,
+        event_id: str,
+        mp4_bytes: Optional[bytes],
+        duration_ms: Optional[int] = None,
+    ) -> None:
+        ...
+
+
+@dataclass(frozen=True)
+class CoyoteMediaClaim:
+    manifest_path: Path
+    manifest: Dict[str, Any]
+
+    @property
+    def kind(self) -> str:
+        return str(self.manifest["kind"])
+
+    @property
+    def event_id(self) -> str:
+        return str(self.manifest["event_id"])
+
+
+class CoyoteSpoolReader:
+    """Read atomic spool entries and claim each artifact at most once."""
+
+    def __init__(self, root: Union[str, Path]) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.events_dir = self.root / "events"
+        self._status_token = None  # type: Optional[Tuple[int, int]]
+
+    def read_status_if_changed(self) -> Optional[str]:
+        path = self.root / "status.json"
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        token = (stat.st_mtime_ns, stat.st_size)
+        if token == self._status_token:
+            return None
+        body = path.read_text(encoding="utf-8")
+        self._status_token = token
+        return body
+
+    def claim_next(self) -> Optional[CoyoteMediaClaim]:
+        for ready_path, manifest in self.ready_manifests():
+            claim = self.claim(str(manifest["event_id"]), str(manifest["kind"]))
+            if claim is not None:
+                return claim
+        return None
+
+    def ready_manifests(self) -> Tuple[Tuple[Path, Dict[str, Any]], ...]:
+        if not self.events_dir.exists():
+            return ()
+        candidates = sorted(
+            self.events_dir.glob("*/*.ready.json"),
+            key=lambda path: (path.parent.name, 0 if path.name.startswith("image.") else 1),
+        )
+        ready = []
+        for ready_path in candidates:
+            if ready_path.name.startswith("video.") and not self._image_terminal(
+                ready_path.parent
+            ):
+                continue
+            try:
+                manifest = json.loads(ready_path.read_text(encoding="utf-8"))
+                self._validate_manifest(ready_path, manifest)
+            except Exception:
+                continue
+            ready.append((ready_path, manifest))
+        return tuple(ready)
+
+    def claim(self, event_id: str, kind: str) -> Optional[CoyoteMediaClaim]:
+        event_id = validate_event_id(event_id)
+        if kind not in ("image", "video"):
+            raise ValueError("coyote media kind must be image or video")
+        ready_path = self.events_dir / event_id / "{}.ready.json".format(kind)
+        if any(
+            (ready_path.parent / "{}.{}.json".format(kind, state)).exists()
+            for state in ("published", "failed")
+        ):
+            return None
+        if kind == "video" and not self._image_terminal(ready_path.parent):
+            return None
+        sending_path = ready_path.with_name("{}.sending.json".format(kind))
+        try:
+            os.replace(str(ready_path), str(sending_path))
+        except FileNotFoundError:
+            return None
+        try:
+            manifest = json.loads(sending_path.read_text(encoding="utf-8"))
+            self._validate_manifest(sending_path, manifest)
+        except Exception as exc:
+            self.fail(CoyoteMediaClaim(sending_path, {}), str(exc))
+            return None
+        return CoyoteMediaClaim(sending_path, manifest)
+
+    def release(self, claim: CoyoteMediaClaim) -> None:
+        ready_path = claim.manifest_path.with_name(
+            claim.manifest_path.name.replace(".sending.json", ".ready.json")
+        )
+        os.replace(str(claim.manifest_path), str(ready_path))
+
+    def publish(self, claim: CoyoteMediaClaim, publisher: MediaPublisher) -> None:
+        manifest = claim.manifest
+        data = None
+        if manifest["result"] == "SUCCESS":
+            media_path = Path(str(manifest["path"]))
+            data = media_path.read_bytes()
+            if len(data) != int(manifest["bytes"]):
+                raise ValueError("spooled media size changed after ready manifest")
+            if hashlib.sha256(data).hexdigest() != str(manifest["sha256"]):
+                raise ValueError("spooled media hash changed after ready manifest")
+        if claim.kind == "image":
+            publisher.publish_image(
+                DetectionType.COYOTE,
+                event_id=claim.event_id,
+                jpeg_bytes=data,
+            )
+        elif claim.kind == "video":
+            publisher.publish_video(
+                DetectionType.COYOTE,
+                event_id=claim.event_id,
+                mp4_bytes=data,
+                duration_ms=int(manifest["duration_ms"]),
+            )
+        else:
+            raise ValueError("unsupported coyote media kind")
+
+    def complete(self, claim: CoyoteMediaClaim) -> Path:
+        published_path = claim.manifest_path.with_name(
+            claim.manifest_path.name.replace(".sending.json", ".published.json")
+        )
+        os.replace(str(claim.manifest_path), str(published_path))
+        return published_path
+
+    def fail(self, claim: CoyoteMediaClaim, reason: str) -> Path:
+        failed_path = claim.manifest_path.with_name(
+            claim.manifest_path.name.replace(".sending.json", ".failed.json")
+        )
+        try:
+            os.replace(str(claim.manifest_path), str(failed_path))
+        except FileNotFoundError:
+            failed_path.parent.mkdir(parents=True, exist_ok=True)
+            failed_path.write_text("{}", encoding="utf-8")
+        error_path = failed_path.with_name(failed_path.stem + ".error.txt")
+        error_path.write_text(str(reason)[:2048], encoding="utf-8")
+        return failed_path
+
+    @staticmethod
+    def _image_terminal(event_dir: Path) -> bool:
+        return any(
+            (event_dir / "image.{}.json".format(state)).exists()
+            for state in ("published", "failed")
+        )
+
+    def _validate_manifest(self, manifest_path: Path, manifest: Any) -> None:
+        if not isinstance(manifest, dict):
+            raise ValueError("coyote media manifest must be a JSON object")
+        if manifest.get("version") != 1:
+            raise ValueError("unsupported coyote media manifest version")
+        event_id = validate_event_id(manifest.get("event_id"))
+        if manifest_path.parent.name != event_id:
+            raise ValueError("manifest event_id does not match its spool directory")
+        kind = manifest.get("kind")
+        if kind not in ("image", "video"):
+            raise ValueError("manifest kind must be image or video")
+        expected_format = "jpeg" if kind == "image" else "mp4"
+        if manifest.get("format") != expected_format:
+            raise ValueError("manifest format does not match media kind")
+        result = manifest.get("result", "SUCCESS")
+        if result not in ("SUCCESS", "FAIL"):
+            raise ValueError("manifest result must be SUCCESS or FAIL")
+        manifest["result"] = result
+        if result == "SUCCESS":
+            media_path = Path(str(manifest.get("path", ""))).expanduser().resolve()
+            expected_path = (
+                manifest_path.parent / ("image.jpg" if kind == "image" else "video.mp4")
+            ).resolve()
+            if media_path != expected_path or not _is_relative_to(
+                media_path, self.events_dir
+            ):
+                raise ValueError("manifest media path escapes its event directory")
+            size = manifest.get("bytes")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError("manifest bytes must be a positive integer")
+            digest = manifest.get("sha256")
+            if not isinstance(digest, str) or len(digest) != 64:
+                raise ValueError("manifest sha256 must be a hex digest")
+        if kind == "video":
+            duration = manifest.get("duration_ms")
+            if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+                raise ValueError("video manifest duration_ms must be positive")
+
+
+class CoyoteMediaWorker:
+    """Bounded worker so base64/video publish never blocks the ROS timer."""
+
+    def __init__(
+        self,
+        reader: CoyoteSpoolReader,
+        publisher: MediaPublisher,
+        *,
+        max_pending: int = 2,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
+        self.reader = reader
+        self.publisher = publisher
+        self.logger = logger or logging.getLogger(__name__)
+        self._queue = queue.Queue(maxsize=max_pending)  # type: queue.Queue
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="coyote-media-mqtt",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, claim: CoyoteMediaClaim) -> bool:
+        if self._closed.is_set():
+            return False
+        try:
+            self._queue.put_nowait(claim)
+        except queue.Full:
+            return False
+        return True
+
+    def close(self, timeout_sec: float = 15.0) -> None:
+        self._closed.set()
+        self._thread.join(timeout=timeout_sec)
+        if self._thread.is_alive():
+            self.logger.error("coyote media worker did not stop within %.1fs", timeout_sec)
+
+    def _run(self) -> None:
+        while not self._closed.is_set() or not self._queue.empty():
+            try:
+                claim = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self.reader.publish(claim, self.publisher)
+            except Exception as exc:
+                self._fail_claim(claim, str(exc))
+                self.logger.exception(
+                    "coyote media publish failed event_id=%s kind=%s",
+                    claim.event_id,
+                    claim.kind,
+                )
+            else:
+                try:
+                    self.reader.complete(claim)
+                except Exception as exc:
+                    self._fail_claim(claim, str(exc))
+                    self.logger.exception(
+                        "coyote media completion failed event_id=%s kind=%s",
+                        claim.event_id,
+                        claim.kind,
+                    )
+            finally:
+                self._queue.task_done()
+
+    def _fail_claim(self, claim: CoyoteMediaClaim, reason: str) -> None:
+        try:
+            self.reader.fail(claim, reason)
+        except Exception:
+            self.logger.exception(
+                "coyote media failure tombstone failed event_id=%s kind=%s",
+                claim.event_id,
+                claim.kind,
+            )
+
+
+def _enum_string(value: Dict[str, Any], key: str, allowed: Tuple[str, ...]) -> str:
+    item = value.get(key)
+    if not isinstance(item, str) or item not in allowed:
+        raise ValueError("{} must be one of {}".format(key, ", ".join(allowed)))
+    return item
+
+
+def _normalize_angle(value: float) -> float:
+    return math.atan2(math.sin(value), math.cos(value))
+
+
+def _optional_string(value: Dict[str, Any], key: str) -> str:
+    item = value.get(key, "")
+    if not isinstance(item, str):
+        raise ValueError("{} must be a string".format(key))
+    return item
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True

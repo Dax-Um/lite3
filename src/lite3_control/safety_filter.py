@@ -1,5 +1,7 @@
 """Final software safety filter before robot output."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from lite3_common.types import StopReason, Twist2D

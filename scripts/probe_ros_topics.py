@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Probe required ROS2 topics without sending any robot motion commands."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sys

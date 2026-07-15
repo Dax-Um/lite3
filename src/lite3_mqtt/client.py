@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from lite3_mqtt.contract import Topics, compact_json
 
@@ -25,6 +25,7 @@ class MqttConfig:
     password: Optional[str] = None
     max_payload_bytes: int = 48 * 1024 * 1024
     publish_timeout_sec: float = 10.0
+    subscriptions: Tuple[str, ...] = Topics.SUBSCRIPTIONS
 
 
 class PahoMqttClient:
@@ -44,6 +45,10 @@ class PahoMqttClient:
         self._stopping = threading.Event()
         self._subscription_mid = None
         self._client = self._build_client()
+
+    @property
+    def connected(self) -> bool:
+        return self._connected.is_set()
 
     def _build_client(self):
         try:
@@ -114,10 +119,20 @@ class PahoMqttClient:
 
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
         _ = userdata, flags, properties
+        # A reconnect is not command-ready until the new subscription set has
+        # received its own successful SUBACK.
+        self._connected.clear()
         if reason_code != 0:
             self._logger.error("MQTT connect rejected rc=%s", reason_code)
             return
-        result, mid = client.subscribe([(topic, 0) for topic in Topics.SUBSCRIPTIONS])
+        if not self.config.subscriptions:
+            self._subscription_mid = None
+            self._connected.set()
+            self._logger.info("MQTT connected (publisher-only client)")
+            return
+        result, mid = client.subscribe(
+            [(topic, 0) for topic in self.config.subscriptions]
+        )
         if result != 0:
             self._logger.error("MQTT subscribe request failed rc=%s", result)
             client.disconnect()
@@ -127,6 +142,13 @@ class PahoMqttClient:
     def _on_subscribe(self, client, userdata, mid, reason_code_list, properties) -> None:
         _ = client, userdata, properties
         if self._subscription_mid != mid:
+            return
+        if len(reason_code_list) != len(self.config.subscriptions):
+            self._logger.error(
+                "MQTT SUBACK count mismatch expected=%s actual=%s",
+                len(self.config.subscriptions),
+                len(reason_code_list),
+            )
             return
         rejected = [
             code
@@ -138,7 +160,10 @@ class PahoMqttClient:
             self._logger.error("MQTT subscriptions rejected reason_codes=%s", rejected)
             return
         self._connected.set()
-        self._logger.info("MQTT connected and subscribed to %s", Topics.SUBSCRIPTIONS)
+        self._logger.info(
+            "MQTT connected and subscribed to %s",
+            self.config.subscriptions,
+        )
 
     def _on_disconnect(
         self,
@@ -163,4 +188,12 @@ class PahoMqttClient:
         if bool(getattr(message, "retain", False)):
             self._logger.warning("retained MQTT command ignored topic=%s", message.topic)
             return
-        self._message_callback(str(message.topic), bytes(message.payload))
+        try:
+            self._message_callback(str(message.topic), bytes(message.payload))
+        except Exception:
+            # A malformed/application-level command must not terminate Paho's
+            # network loop and silently disable reconnects or safety callbacks.
+            self._logger.exception(
+                "MQTT message callback failed topic=%s",
+                message.topic,
+            )

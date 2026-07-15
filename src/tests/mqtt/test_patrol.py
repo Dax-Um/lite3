@@ -11,6 +11,9 @@ from lite3_mqtt.patrol import (
     NavSafetyState,
     Waypoint,
     WaypointRoute,
+    _goal_progressed,
+    _twist_is_finite,
+    _validate_computed_path,
     _validate_route_on_costmap,
 )
 from lite3_mqtt.patrol import PatrolConfig
@@ -52,6 +55,31 @@ offsets:
     assert first.waypoints[1].y == pytest.approx(22.0)
     assert first.waypoints[2].x == pytest.approx(10.0)
     assert first.waypoints[2].y == pytest.approx(20.0)
+
+
+def test_absolute_waypoints_keep_map_coordinates_and_face_each_leg(tmp_path):
+    config = tmp_path / "absolute.yaml"
+    config.write_text(
+        """
+route_id: known_good
+frame_id: map
+min_distance_m: 1.0
+absolute_waypoints:
+  - {x: 4.13, y: 1.41}
+  - {x: 1.71, y: 2.93}
+""",
+        encoding="utf-8",
+    )
+    home = Waypoint(id="home", x=1.03, y=0.28, yaw=0.0)
+
+    route = PatrolConfig.from_yaml(config).build_route(home)
+
+    assert [(item.x, item.y) for item in route.waypoints] == pytest.approx(
+        [(4.13, 1.41), (1.71, 2.93), (1.03, 0.28)]
+    )
+    assert route.waypoints[0].yaw == pytest.approx(math.atan2(1.13, 3.10))
+    assert route.waypoints[1].yaw == pytest.approx(math.atan2(1.52, -2.42))
+    assert route.waypoints[2].yaw == pytest.approx(math.atan2(-2.65, -0.68))
 
 
 def test_duplicate_start_is_idempotent(tmp_path):
@@ -97,6 +125,33 @@ def test_startup_gate_runs_before_current_pose_capture(tmp_path):
         time.sleep(0.01)
     controller.close()
     assert calls[:2] == ["gate", "pose"]
+
+
+def test_prepare_motion_runs_startup_gate_without_sending_route(tmp_path):
+    config = tmp_path / "triangle.yaml"
+    config.write_text(
+        "route_id: triangle\nframe_id: map\nmin_distance_m: 1.0\n"
+        "equilateral_triangle_side_m: 2.0\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class Gate:
+        def ensure_ready(self):
+            calls.append("gate")
+
+    backend = MockPatrolBackend()
+    controller = ContinuousPatrolController(
+        backend=backend,
+        patrol_config=config,
+        startup_gate=Gate(),
+    )
+
+    controller.prepare_motion()
+    controller.close()
+
+    assert calls == ["gate"]
+    assert backend.routes == []
 
 
 def test_forward_patrol_has_no_lateral_offset_and_faces_travel_direction(tmp_path):
@@ -153,7 +208,7 @@ offsets:
         PatrolConfig.from_yaml(config)
 
 
-def test_equilateral_triangle_uses_current_pose_and_faces_each_edge(tmp_path):
+def test_equilateral_triangle_uses_current_pose_and_last_known_good_headings(tmp_path):
     config = tmp_path / "triangle.yaml"
     config.write_text(
         """
@@ -175,6 +230,7 @@ equilateral_triangle_side_m: 2.0
     assert route.waypoints[1].y == pytest.approx(2.0 + math.sqrt(3.0))
     assert route.waypoints[0].yaw == pytest.approx(2.0 * math.pi / 3.0)
     assert route.waypoints[1].yaw == pytest.approx(-2.0 * math.pi / 3.0)
+    assert route.waypoints[2].yaw == pytest.approx(0.0)
     physical_route = [home] + route.waypoints
     for start, end in zip(physical_route, physical_route[1:]):
         assert math.hypot(end.x - start.x, end.y - start.y) == pytest.approx(2.0)
@@ -200,7 +256,9 @@ equilateral_triangle_heading_deg: 240.0
     assert route.waypoints[0].y == pytest.approx(-1.0 - math.sqrt(3.0))
     assert route.waypoints[1].x == pytest.approx(9.0)
     assert route.waypoints[1].y == pytest.approx(-1.0 - math.sqrt(3.0))
-    assert route.waypoints[2].yaw == pytest.approx(math.radians(240.0))
+    assert route.waypoints[0].yaw == pytest.approx(0.0)
+    assert route.waypoints[1].yaw == pytest.approx(math.radians(120.0))
+    assert route.waypoints[2].yaw == pytest.approx(math.radians(-120.0))
 
 
 def test_triangle_preflight_tries_alternate_headings(tmp_path):
@@ -359,7 +417,7 @@ def test_succeeded_status_with_missed_waypoint_does_not_repeat(tmp_path):
 
 def test_nav_safety_state_uses_reception_age_and_lateral_velocity():
     state = NavSafetyState()
-    state.mark_odom(now=10.0, frame_id="map")
+    state.mark_odom(now=10.0, frame_id="map", x=1.0, y=2.0, yaw=0.0)
     state.mark_localization(now=10.0, converged=True)
     state.mark("local_costmap", 10.0)
     state.mark("global_costmap", 10.0)
@@ -372,6 +430,29 @@ def test_nav_safety_state_uses_reception_age_and_lateral_velocity():
     )
     assert "odom_stale" in reasons
     assert "lateral_cmd_vel" in reasons
+
+
+def test_cmd_vel_rejects_non_finite_value_in_any_twist_component():
+    def vector(x=0.0, y=0.0, z=0.0):
+        return SimpleNamespace(x=x, y=y, z=z)
+
+    assert _twist_is_finite(
+        SimpleNamespace(linear=vector(), angular=vector())
+    )
+    assert not _twist_is_finite(
+        SimpleNamespace(linear=vector(x=float("nan")), angular=vector())
+    )
+    assert not _twist_is_finite(
+        SimpleNamespace(linear=vector(), angular=vector(z=float("inf")))
+    )
+
+    state = NavSafetyState()
+    state.mark_cmd_vel(0.0, valid=False)
+    assert "cmd_vel_invalid" in state.blocking_reasons(
+        now=0.0,
+        max_age_sec=1.0,
+        max_lateral_speed_mps=0.02,
+    )
 
 
 def test_route_preflight_rejects_unknown_or_occupied_cells():
@@ -390,11 +471,268 @@ def test_route_preflight_rejects_unknown_or_occupied_cells():
         waypoints=[Waypoint("p1", 2.0, 1.0, 0.0)],
     )
     start = Waypoint("home", 1.0, 1.0, 0.0)
-    free = SimpleNamespace(info=info, data=[0] * 25)
+    header = SimpleNamespace(frame_id="map")
+    free = SimpleNamespace(header=header, info=info, data=[0] * 25)
     _validate_route_on_costmap(route, start=start, costmap=free)
 
     blocked_data = [0] * 25
     blocked_data[1 * 5 + 2] = 100
-    blocked = SimpleNamespace(info=info, data=blocked_data)
-    with pytest.raises(ValueError, match="not free"):
+    blocked = SimpleNamespace(header=header, info=info, data=blocked_data)
+    with pytest.raises(ValueError, match="not known free"):
         _validate_route_on_costmap(route, start=start, costmap=blocked)
+
+    wrong_frame = SimpleNamespace(
+        header=SimpleNamespace(frame_id="odom"), info=info, data=[0] * 25
+    )
+    with pytest.raises(ValueError, match="does not match route frame"):
+        _validate_route_on_costmap(route, start=start, costmap=wrong_frame)
+
+
+def test_route_preflight_rejects_inflated_cost_and_requires_clearance():
+    orientation = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+    info = SimpleNamespace(
+        resolution=0.1,
+        width=40,
+        height=40,
+        origin=SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0),
+            orientation=orientation,
+        ),
+    )
+    route = WaypointRoute(
+        route_id="test",
+        frame_id="map",
+        loop=False,
+        waypoints=[Waypoint("p1", 2.0, 2.0, 0.0)],
+    )
+    start = Waypoint("home", 1.0, 1.0, 0.0)
+    inflated = [0] * (info.width * info.height)
+    inflated[20 * info.width + 20] = 50
+    with pytest.raises(ValueError, match="not known free"):
+        _validate_route_on_costmap(
+            route,
+            start=start,
+            costmap=SimpleNamespace(
+                header=SimpleNamespace(frame_id="map"), info=info, data=inflated
+            ),
+            clearance_m=0.0,
+        )
+
+    obstacle = [0] * (info.width * info.height)
+    obstacle[20 * info.width + 22] = 100
+    with pytest.raises(ValueError, match="corridor home->p1 is not known free"):
+        _validate_route_on_costmap(
+            route,
+            start=start,
+            costmap=SimpleNamespace(
+                header=SimpleNamespace(frame_id="map"), info=info, data=obstacle
+            ),
+            clearance_m=0.35,
+        )
+
+
+def test_route_preflight_rejects_blocked_future_leg_corridor():
+    orientation = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+    info = SimpleNamespace(
+        resolution=0.1,
+        width=60,
+        height=60,
+        origin=SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0),
+            orientation=orientation,
+        ),
+    )
+    route = WaypointRoute(
+        route_id="test",
+        frame_id="map",
+        loop=False,
+        waypoints=[
+            Waypoint("p1", 3.0, 1.0, 0.0),
+            Waypoint("p2", 3.0, 3.0, math.pi / 2.0),
+        ],
+    )
+    start = Waypoint("home", 1.0, 1.0, 0.0)
+    data = [0] * (info.width * info.height)
+    data[20 * info.width + 30] = 100
+
+    with pytest.raises(ValueError, match="corridor p1->p2 is not known free"):
+        _validate_route_on_costmap(
+            route,
+            start=start,
+            costmap=SimpleNamespace(
+                header=SimpleNamespace(frame_id="map"), info=info, data=data
+            ),
+            clearance_m=0.0,
+        )
+
+
+def test_nav_safety_state_reports_arrival_position_and_yaw_error():
+    state = NavSafetyState()
+    state.mark_odom(now=10.0, frame_id="map", x=1.1, y=1.2, yaw=0.4)
+
+    position_error, yaw_error = state.arrival_error(
+        Waypoint("p1", 1.0, 1.0, 0.1)
+    )
+
+    assert position_error == pytest.approx(math.hypot(0.1, 0.2))
+    assert yaw_error == pytest.approx(0.3)
+
+    state.mark_odom(now=10.5, frame_id="odom", x=1.0, y=1.0, yaw=0.1)
+    assert state.arrival_error(Waypoint("p1", 1.0, 1.0, 0.1)) is None
+
+    state.mark_odom(now=11.0, frame_id="map", x=float("nan"), y=1.2, yaw=0.4)
+    assert state.arrival_error(Waypoint("p1", 1.0, 1.0, 0.1)) is None
+    reasons = state.blocking_reasons(
+        now=11.0, max_age_sec=1.0, max_lateral_speed_mps=0.02
+    )
+    assert "odom_pose_invalid" in reasons
+
+
+def test_progress_requires_goal_approach_or_goal_yaw_improvement_near_goal():
+    goal = Waypoint("p1", 3.0, 2.0, 1.0)
+    reference = Waypoint("odom", 1.0, 2.0, 0.5)
+
+    assert not _goal_progressed(
+        reference,
+        Waypoint("odom", 1.02, 2.01, 0.53),
+        goal,
+        distance_m=0.10,
+        yaw_rad=0.15,
+        yaw_progress_position_m=0.30,
+    )
+    assert _goal_progressed(
+        reference,
+        Waypoint("odom", 1.11, 2.0, 0.5),
+        goal,
+        distance_m=0.10,
+        yaw_rad=0.15,
+        yaw_progress_position_m=0.30,
+    )
+    assert not _goal_progressed(
+        reference,
+        Waypoint("odom", 0.89, 2.0, 0.66),
+        goal,
+        distance_m=0.10,
+        yaw_rad=0.15,
+        yaw_progress_position_m=0.30,
+    )
+
+    near_reference = Waypoint("odom", 2.8, 2.0, 0.5)
+    assert _goal_progressed(
+        near_reference,
+        Waypoint("odom", 2.8, 2.0, 0.66),
+        goal,
+        distance_m=0.10,
+        yaw_rad=0.15,
+        yaw_progress_position_m=0.30,
+    )
+    assert not _goal_progressed(
+        near_reference,
+        Waypoint("odom", 2.8, 2.0, 0.34),
+        goal,
+        distance_m=0.10,
+        yaw_rad=0.15,
+        yaw_progress_position_m=0.30,
+    )
+
+
+def test_computed_path_requires_reachable_goal_and_bounded_detour():
+    orientation = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+    info = SimpleNamespace(
+        resolution=0.1,
+        width=60,
+        height=60,
+        origin=SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0),
+            orientation=orientation,
+        ),
+    )
+    costmap = SimpleNamespace(
+        header=SimpleNamespace(frame_id="map"),
+        info=info,
+        data=[0] * (info.width * info.height),
+    )
+    start = Waypoint("home", 1.0, 1.0, 0.0)
+    goal = Waypoint("p1", 3.0, 1.0, 0.0)
+
+    def pose(x, y, frame_id="map"):
+        return SimpleNamespace(
+            header=SimpleNamespace(frame_id=frame_id),
+            pose=SimpleNamespace(position=SimpleNamespace(x=x, y=y)),
+        )
+
+    path = SimpleNamespace(
+        header=SimpleNamespace(frame_id="map"),
+        poses=[pose(1.0, 1.0), pose(2.0, 1.0), pose(3.0, 1.0)],
+    )
+    _validate_computed_path(
+        path,
+        frame_id="map",
+        start=start,
+        goal=goal,
+        leg_index=1,
+        costmap=costmap,
+        max_detour_ratio=3.0,
+    )
+
+    empty = SimpleNamespace(header=SimpleNamespace(frame_id="map"), poses=[])
+    with pytest.raises(ValueError, match="empty path"):
+        _validate_computed_path(
+            empty,
+            frame_id="map",
+            start=start,
+            goal=goal,
+            leg_index=1,
+            costmap=costmap,
+            max_detour_ratio=3.0,
+        )
+
+    wrong_endpoint = SimpleNamespace(
+        header=SimpleNamespace(frame_id="map"),
+        poses=[pose(1.0, 1.0), pose(2.0, 1.0)],
+    )
+    with pytest.raises(ValueError, match="from goal"):
+        _validate_computed_path(
+            wrong_endpoint,
+            frame_id="map",
+            start=start,
+            goal=goal,
+            leg_index=1,
+            costmap=costmap,
+            max_detour_ratio=3.0,
+        )
+
+    wrong_start = SimpleNamespace(
+        header=SimpleNamespace(frame_id="map"),
+        poses=[pose(2.0, 1.0), pose(3.0, 1.0)],
+    )
+    with pytest.raises(ValueError, match="captured pose"):
+        _validate_computed_path(
+            wrong_start,
+            frame_id="map",
+            start=start,
+            goal=goal,
+            leg_index=1,
+            costmap=costmap,
+            max_detour_ratio=3.0,
+        )
+
+    detour = SimpleNamespace(
+        header=SimpleNamespace(frame_id="map"),
+        poses=[
+            pose(1.0, 1.0),
+            pose(1.0, 5.0),
+            pose(3.0, 5.0),
+            pose(3.0, 1.0),
+        ],
+    )
+    with pytest.raises(ValueError, match="detour is too long"):
+        _validate_computed_path(
+            detour,
+            frame_id="map",
+            start=start,
+            goal=goal,
+            leg_index=1,
+            costmap=costmap,
+            max_detour_ratio=3.0,
+        )

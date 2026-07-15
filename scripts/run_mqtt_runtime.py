@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -16,16 +17,14 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 from lite3_mqtt.client import MqttConfig, PahoMqttClient  # noqa: E402
+from lite3_mqtt.contract import Topics, parse_detection_trigger  # noqa: E402
 from lite3_mqtt.media import DetectionMediaPublisher, MockAnnotatedMediaSource  # noqa: E402
-from lite3_mqtt.perception_host import (  # noqa: E402
-    PerceptionHostConfig,
-    PerceptionHostNavManager,
-    PerceptionHostStartupGate,
+from lite3_mqtt.direct_patrol import (  # noqa: E402
+    DirectMockPatrolBackend,
+    DirectNav2PatrolBackend,
+    DirectPatrolController,
 )
 from lite3_mqtt.patrol import (  # noqa: E402
-    ContinuousPatrolController,
-    MockPatrolBackend,
-    Nav2PatrolBackend,
     Waypoint,
 )
 from lite3_mqtt.runtime import Lite3MqttRuntime  # noqa: E402
@@ -36,26 +35,23 @@ DEFAULT_PATROL_CONFIG = ROOT / "configs" / "routes" / "mqtt_triangle_patrol.yaml
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--broker-host", default="127.0.0.1")
-    parser.add_argument("--broker-port", type=int, default=1883)
+    parser.add_argument("--broker-host", default=os.environ.get("MQTT_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--broker-port",
+        type=int,
+        default=int(os.environ.get("MQTT_PORT", "1883")),
+    )
     parser.add_argument("--client-id", default="lite3-runtime")
-    parser.add_argument("--username")
-    parser.add_argument("--password")
+    parser.add_argument("--username", default=os.environ.get("MQTT_USER") or None)
+    parser.add_argument("--password", default=os.environ.get("MQTT_PASS") or None)
     parser.add_argument("--patrol-config", default=str(DEFAULT_PATROL_CONFIG))
     parser.add_argument("--patrol-backend", choices=("mock", "nav2"), default="mock")
     parser.add_argument("--allow-robot-motion", action="store_true")
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--action-name", default="/FollowWaypoints")
-    parser.add_argument("--perception-host", default="192.168.1.103")
-    parser.add_argument("--perception-user", default="ysc")
-    parser.add_argument("--perception-remote-root", default="/home/ysc/lite3")
-    parser.add_argument("--perception-connect-timeout-sec", type=float, default=5.0)
-    parser.add_argument("--perception-ready-timeout-sec", type=float, default=90.0)
-    parser.add_argument("--nav-data-stale-sec", type=float, default=2.0)
+    parser.add_argument("--nav-timeout-sec", type=float, default=10.0)
     parser.add_argument("--nav-route-timeout-sec", type=float, default=300.0)
     parser.add_argument("--nav-cancel-timeout-sec", type=float, default=5.0)
-    parser.add_argument("--max-lateral-speed-mps", type=float, default=0.02)
-    parser.add_argument("--no-auto-start-perception-nav", action="store_true")
     parser.add_argument("--mock-home", nargs=3, type=float, default=(0.0, 0.0, 0.0))
     parser.add_argument("--mock-route-duration-sec", type=float, default=0.2)
     parser.add_argument(
@@ -65,6 +61,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="0 repeats forever; use 1 for the first physical movement test.",
     )
     parser.add_argument("--video-duration-ms", type=int, default=5000)
+    parser.add_argument(
+        "--mock-detection-media",
+        action="store_true",
+        help="publish generated test image/video directly from MQTT triggers",
+    )
     parser.add_argument("--run-seconds", type=float, default=0.0)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
@@ -85,39 +86,23 @@ def main(argv=None) -> int:
         return 3
 
     if args.patrol_backend == "nav2":
-        backend = Nav2PatrolBackend(
+        backend = DirectNav2PatrolBackend(
             odom_topic=args.odom_topic,
             action_name=args.action_name,
-            timeout_sec=args.perception_ready_timeout_sec,
-            max_data_age_sec=args.nav_data_stale_sec,
-            max_lateral_speed_mps=args.max_lateral_speed_mps,
+            timeout_sec=args.nav_timeout_sec,
             route_timeout_sec=args.nav_route_timeout_sec,
             cancel_timeout_sec=args.nav_cancel_timeout_sec,
         )
-        manager = PerceptionHostNavManager(
-            PerceptionHostConfig(
-                host=args.perception_host,
-                user=args.perception_user,
-                remote_root=args.perception_remote_root,
-                connect_timeout_sec=args.perception_connect_timeout_sec,
-                ready_timeout_sec=args.perception_ready_timeout_sec,
-                auto_start_navigation=not args.no_auto_start_perception_nav,
-            ),
-            logger=logger,
-        )
-        startup_gate = PerceptionHostStartupGate(manager, backend)
     else:
         x, y, yaw = args.mock_home
-        backend = MockPatrolBackend(
+        backend = DirectMockPatrolBackend(
             home=Waypoint(id="home", x=x, y=y, yaw=yaw),
             route_duration_sec=args.mock_route_duration_sec,
         )
-        startup_gate = None
 
-    patrol = ContinuousPatrolController(
+    patrol = DirectPatrolController(
         backend=backend,
         patrol_config=args.patrol_config,
-        startup_gate=startup_gate,
         max_loops=args.max_patrol_loops,
         logger=logger,
     )
@@ -125,6 +110,18 @@ def main(argv=None) -> int:
     runtime_holder = {}
 
     def on_message(topic: str, payload: bytes) -> None:
+        if topic in {Topics.SOUND_DETECT, Topics.COYOTE_DETECT}:
+            trigger = parse_detection_trigger(topic, payload)
+            # The patrol runtime owns the active Nav2 goal.  Relinquish it as
+            # soon as a detection event arrives so the coyote bridge can take
+            # over /cmd_vel after Nav2 becomes idle.
+            patrol.stop()
+            logger.info(
+                "patrol stopped for detection event_id=%s type=%s",
+                trigger.event_id,
+                trigger.detection_type.value,
+            )
+            return
         runtime_holder["runtime"].handle_message(topic, payload)
 
     def on_connection_lost() -> None:
@@ -139,6 +136,11 @@ def main(argv=None) -> int:
             client_id=args.client_id,
             username=args.username,
             password=args.password,
+            subscriptions=(
+                Topics.AUTO_PATROL,
+                Topics.SOUND_DETECT,
+                Topics.COYOTE_DETECT,
+            ),
         ),
         on_message=on_message,
         on_connection_lost=on_connection_lost,
@@ -153,6 +155,8 @@ def main(argv=None) -> int:
     runtime = Lite3MqttRuntime(
         patrol=patrol,
         detection_publisher=media_publisher,
+        publish_trigger_media=args.mock_detection_media,
+        patrol_only=True,
         logger=logger,
     )
     runtime_holder["runtime"] = runtime
@@ -181,8 +185,10 @@ def main(argv=None) -> int:
     finally:
         if timer is not None:
             timer.cancel()
-        runtime.close()
-        client.stop()
+        try:
+            runtime.close()
+        finally:
+            client.stop()
     return 0
 
 

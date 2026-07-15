@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exec docker run --rm \
   --network host \
   --env PYTHONDONTWRITEBYTECODE=1 \
+  --env "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
+  --env ROS_LOCALHOST_ONLY=0 \
+  --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   --volume "${ROOT}:/workspace/lite3" \
   --workdir /workspace/lite3 \
   iq9-lite3-mqtt-foxy:latest \

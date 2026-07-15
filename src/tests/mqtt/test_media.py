@@ -51,3 +51,30 @@ def test_media_failures_publish_contract_fail_payloads():
     assert [payload["result"] for _, payload in published] == ["FAIL", "FAIL"]
     assert published[0][1]["image"]["data_base64"] == ""
     assert published[1][1]["video"]["data_base64"] == ""
+
+
+def test_stored_media_can_publish_image_and_video_independently():
+    published = []
+    publisher = DetectionMediaPublisher(
+        media_source=None,
+        publish_json=lambda topic, payload: published.append((topic, payload)),
+    )
+
+    publisher.publish_image(
+        DetectionType.COYOTE,
+        event_id="coyote-event",
+        jpeg_bytes=b"\xff\xd8image\xff\xd9",
+    )
+    publisher.publish_video(
+        DetectionType.COYOTE,
+        event_id="coyote-event",
+        mp4_bytes=b"\x00\x00\x00\x18ftypmp42",
+        duration_ms=5000,
+    )
+
+    assert [topic for topic, _ in published] == [
+        Topics.COYOTE_IMAGE,
+        Topics.COYOTE_VIDEO,
+    ]
+    assert published[0][1]["event_id"] == published[1][1]["event_id"]
+    assert published[1][1]["video"]["duration_ms"] == 5000

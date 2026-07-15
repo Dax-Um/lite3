@@ -1,5 +1,7 @@
 """Front boundary detector for lane-end events."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from math import isfinite
 

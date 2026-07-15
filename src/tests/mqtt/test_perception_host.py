@@ -71,25 +71,7 @@ def test_auto_start_can_be_disabled():
         manager.ensure_navigation()
 
 
-def test_startup_gate_uses_existing_ros_graph_without_ssh():
-    calls = []
-
-    class Manager:
-        def ensure_navigation(self):
-            calls.append("ssh")
-
-        def ensure_watchdog(self):
-            calls.append("watchdog")
-
-    class Backend:
-        def wait_until_ready(self, timeout_sec=None):
-            calls.append("ros")
-
-    PerceptionHostStartupGate(Manager(), Backend()).ensure_ready()
-    assert calls == ["ros", "watchdog"]
-
-
-def test_startup_gate_starts_remote_nav_only_when_ros_graph_is_missing():
+def test_startup_gate_always_checks_perception_host_before_ros_graph():
     calls = []
 
     class Manager:
@@ -97,14 +79,23 @@ def test_startup_gate_starts_remote_nav_only_when_ros_graph_is_missing():
             calls.append("ssh")
 
     class Backend:
-        def __init__(self):
-            self.count = 0
-
         def wait_until_ready(self, timeout_sec=None):
-            self.count += 1
             calls.append("ros")
-            if self.count == 1:
-                raise TimeoutError("not ready")
 
     PerceptionHostStartupGate(Manager(), Backend()).ensure_ready()
-    assert calls == ["ros", "ssh", "ros"]
+    assert calls == ["ssh", "ros"]
+
+
+def test_startup_gate_propagates_remote_readiness_before_ros_probe():
+    calls = []
+
+    class Manager:
+        def ensure_navigation(self):
+            calls.append("ssh")
+
+    class Backend:
+        def wait_until_ready(self, timeout_sec=None):
+            calls.append("ros")
+
+    PerceptionHostStartupGate(Manager(), Backend()).ensure_ready()
+    assert calls == ["ssh", "ros"]

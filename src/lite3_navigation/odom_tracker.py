@@ -1,5 +1,7 @@
 """Lite3 odometry tracker."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from math import hypot
 

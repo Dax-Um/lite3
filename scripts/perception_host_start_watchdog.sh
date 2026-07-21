@@ -23,15 +23,25 @@ WATCHDOG="${LITE3_NAV_WATCHDOG_SCRIPT:-$ROOT/scripts/run_nav_watchdog.py}"
 LOG_FILE="${LITE3_NAV_WATCHDOG_LOG:-/tmp/lite3_nav_watchdog.log}"
 
 if [ "$MODE" = "dry-run" ]; then
-  echo "check process: run_nav_watchdog.py"
+  echo "stop existing process: run_nav_watchdog.py"
   echo "start: python3 $WATCHDOG"
   exit 0
 fi
 
 test -f "$WATCHDOG"
 if pgrep -af "[r]un_nav_watchdog.py" >/dev/null; then
-  echo "navigation watchdog already running"
-  exit 0
+  echo "stopping existing navigation watchdog"
+  pkill -TERM -f "[r]un_nav_watchdog.py" || true
+  for _ in $(seq 1 30); do
+    if ! pgrep -af "[r]un_nav_watchdog.py" >/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if pgrep -af "[r]un_nav_watchdog.py" >/dev/null; then
+    echo "existing navigation watchdog did not stop" >&2
+    exit 1
+  fi
 fi
 
 nohup python3 "$WATCHDOG" >"$LOG_FILE" 2>&1 &

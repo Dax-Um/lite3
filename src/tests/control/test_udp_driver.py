@@ -6,7 +6,15 @@ import struct
 import pytest
 
 from lite3_common.types import MotionLimits
-from lite3_control.udp_driver import DriverSendError, Lite3UdpDriver
+from lite3_control.udp_driver import (
+    CMD_FLAT_GAIT_FAST,
+    CMD_FLAT_GAIT_SLOW,
+    CMD_NAVIGATION_MODE,
+    CMD_STOP_ACTION,
+    CMD_TWIST_JUMP,
+    DriverSendError,
+    Lite3UdpDriver,
+)
 
 
 EXAMPLE_HOST = "203.0.113.10"
@@ -37,6 +45,10 @@ def unpack_packet(packet: bytes) -> tuple[int, int, int, float]:
     return struct.unpack("<iiid", packet)
 
 
+def unpack_simple_packet(packet: bytes) -> tuple[int, int, int]:
+    return struct.unpack("<iii", packet)
+
+
 def make_driver(fake_socket: FakeSocket | None = None) -> Lite3UdpDriver:
     return Lite3UdpDriver(
         EXAMPLE_HOST,
@@ -60,6 +72,37 @@ def test_packet_fields_for_vx():
     packet = driver.pack_motion_complex_cmd(320, 0.1)
 
     assert unpack_packet(packet) == (320, 8, 1, 0.1)
+
+
+def test_simple_packet_is_three_little_endian_int32_values():
+    driver = make_driver()
+
+    packet = driver.pack_motion_simple_cmd(CMD_FLAT_GAIT_FAST)
+
+    assert len(packet) == 12
+    assert unpack_simple_packet(packet) == (CMD_FLAT_GAIT_FAST, 0, 0)
+
+
+def test_completion_simple_commands_use_documented_codes():
+    fake_socket = FakeSocket()
+    driver = make_driver(fake_socket)
+
+    for command in (
+        CMD_FLAT_GAIT_FAST,
+        CMD_FLAT_GAIT_SLOW,
+        CMD_TWIST_JUMP,
+        CMD_STOP_ACTION,
+        CMD_NAVIGATION_MODE,
+    ):
+        driver.send_simple_command(command)
+
+    assert [unpack_simple_packet(packet) for packet, _ in fake_socket.sent] == [
+        (CMD_FLAT_GAIT_FAST, 0, 0),
+        (CMD_FLAT_GAIT_SLOW, 0, 0),
+        (CMD_TWIST_JUMP, 0, 0),
+        (CMD_STOP_ACTION, 0, 0),
+        (CMD_NAVIGATION_MODE, 0, 0),
+    ]
 
 
 def test_packet_fields_for_vy():

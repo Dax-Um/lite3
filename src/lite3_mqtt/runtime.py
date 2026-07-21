@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -55,6 +56,67 @@ class Lite3MqttRuntime:
         self._recent_patrol_commands = deque(maxlen=64)
         self._recent_patrol_command_set = set()
         self._last_patrol_timestamp = None  # type: Optional[int]
+        self._mission_events = deque(maxlen=256)  # type: Deque[str]
+        self._mission_event_set = set()  # type: Set[str]
+        self._active_coyote_mission_id = None  # type: Optional[str]
+
+    def reserve_coyote_mission(self, event_id: str) -> bool:
+        with self._state_lock:
+            if self._closed or self._active_coyote_mission_id is not None:
+                return False
+            self._active_coyote_mission_id = event_id
+            return True
+
+    def release_coyote_mission(self, event_id: str) -> None:
+        with self._state_lock:
+            if self._active_coyote_mission_id == event_id:
+                self._active_coyote_mission_id = None
+
+    def handle_mission_event(
+        self,
+        payload: str,
+        *,
+        on_coyote_home_reached=None,
+    ) -> None:
+        """Apply a private ROS mission transition without re-entering MQTT."""
+        try:
+            event = json.loads(payload)
+            if not isinstance(event, dict):
+                raise ValueError("mission event must be a JSON object")
+            event_id = event.get("event_id")
+            if not isinstance(event_id, str) or not event_id:
+                raise ValueError("mission event requires event_id")
+            if event.get("source") not in {"coyote", "broken_cup"} or event.get("state") != "COMPLETED":
+                raise ValueError("unsupported mission event source/state")
+            if event.get("requested_action") != "RETURN_HOME":
+                raise ValueError("unsupported mission event action")
+        except Exception:
+            self.logger.exception("internal mission event rejected payload=%r", payload[:256])
+            return
+        with self._state_lock:
+            if self._closed:
+                return
+            if event_id in self._mission_event_set:
+                self.logger.info("duplicate internal mission event ignored event_id=%s", event_id)
+                return
+            if len(self._mission_events) == self._mission_events.maxlen:
+                evicted = self._mission_events.popleft()
+                self._mission_event_set.discard(evicted)
+            self._mission_events.append(event_id)
+            self._mission_event_set.add(event_id)
+            source = event["source"]
+            callback = None
+            if source == "coyote" and on_coyote_home_reached is not None:
+                callback = lambda: on_coyote_home_reached(event_id)
+            started = self.patrol.return_home(
+                spin_after_arrival=(source == "coyote"),
+                on_complete=callback,
+            )
+        self.logger.info(
+            "internal mission RETURN_HOME event_id=%s started=%s",
+            event_id,
+            started,
+        )
 
     def handle_message(self, topic: str, payload: bytes) -> None:
         try:

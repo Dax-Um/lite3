@@ -32,6 +32,8 @@ class CoyoteTopicConfig:
     miss_lost: int = 8
     near_enter: float = 0.65
     near_exit: float = 0.50
+    # Height ratio is normalized by the live UDP frame height, never pixels.
+    long_jump_height_ratio: float = 0.45
     # Retained for the current IQ9 main() call. The external contract fixes
     # this band at 40%..60%, so any other value is rejected fail-closed.
     center_half_ratio: float = 0.10
@@ -91,6 +93,11 @@ class CoyoteController:
             and 0.0 <= self.cfg.near_exit < self.cfg.near_enter <= 1.0
         ):
             raise ValueError("coyote near thresholds must satisfy 0 <= exit < enter <= 1")
+        if not (
+            math.isfinite(self.cfg.long_jump_height_ratio)
+            and 0.0 < self.cfg.long_jump_height_ratio < self.cfg.near_enter
+        ):
+            raise ValueError("long jump height ratio must be in (0, near_enter)")
         if not math.isclose(
             self.cfg.center_half_ratio,
             0.10,
@@ -277,6 +284,16 @@ class CoyoteController:
             "detect": public_detect,
             "motion": self.motion if public_detect == "detected" else "stop",
             "side": self.side if public_detect == "detected" else "none",
+            "height_ratio": round(self.height_ratio, 4),
+            # An internal bridge hint.  It preserves the existing
+            # detected/forward/stop contract and is normalized to this frame's
+            # actual height, so UDP resolution changes need no retuning.
+            "long_jump_ready": (
+                public_detect == "detected"
+                and self.side == "center"
+                and not self.near_mode
+                and self.height_ratio >= self.cfg.long_jump_height_ratio
+            ),
         }
 
     def _episode_tag(self) -> str:

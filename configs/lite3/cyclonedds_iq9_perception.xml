@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  IQ9 is dual-homed.  Keep DDS traffic for perception on end0 instead of
+  letting Cyclone DDS select Wi-Fi or loopback.  The perception host remains
+  unchanged; it is reached through its existing ROS 2 participant.
+-->
+<CycloneDDS>
+  <Domain id="any">
+    <General>
+      <NetworkInterfaceAddress>end0</NetworkInterfaceAddress>
+      <AllowMulticast>true</AllowMulticast>
+    </General>
+    <Discovery>
+      <Peers>
+        <Peer address="192.168.1.103" />
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>

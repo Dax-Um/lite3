@@ -19,10 +19,25 @@ MOTION_COMPLEX_CMD_FORMAT = "<iiid"
 MOTION_COMPLEX_CMD_SIZE = struct.calcsize(MOTION_COMPLEX_CMD_FORMAT)
 MOTION_COMPLEX_CMD_DATA_SIZE = 8
 MOTION_COMPLEX_CMD_TYPE = 1
+MOTION_SIMPLE_CMD_FORMAT = "<iii"
+MOTION_SIMPLE_CMD_SIZE = struct.calcsize(MOTION_SIMPLE_CMD_FORMAT)
+MOTION_SIMPLE_CMD_TYPE = 0
 
 CMD_LINEAR_X = 320
 CMD_LINEAR_Y = 325
 CMD_ANGULAR_Z = 321
+
+# Motion-host simple commands.  The command header is the same UDP transport
+# used for cmd_vel, with no trailing double payload.
+CMD_FLAT_GAIT_SLOW = 0x21010300
+CMD_FLAT_GAIT_FAST = 0x21010303
+CMD_TWIST_JUMP = 0x2101020D
+CMD_LONG_JUMP = 0x2101050B
+CMD_HELLO = 0x21010507
+CMD_STOP_ACTION = 0x21010C0B
+CMD_MANUAL_MODE = 0x21010C02
+CMD_NAVIGATION_MODE = 0x21010C03
+CMD_STAND_SIT = 0x21010202
 
 
 class DriverSendError(RuntimeError):
@@ -80,6 +95,30 @@ class Lite3UdpDriver:
             MOTION_COMPLEX_CMD_TYPE,
             value,
         )
+
+    def pack_motion_simple_cmd(self, cmd_code: int, value: int = 0) -> bytes:
+        """Encode a motion-host type-0 command as three little-endian int32s."""
+        if isinstance(cmd_code, bool) or not isinstance(cmd_code, int):
+            raise ValueError("simple command code must be an int32")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("simple command value must be an int32")
+        if not -(2**31) <= cmd_code < 2**31:
+            raise ValueError("simple command code must fit int32")
+        if not -(2**31) <= value < 2**31:
+            raise ValueError("simple command value must fit int32")
+        return struct.pack(
+            MOTION_SIMPLE_CMD_FORMAT,
+            cmd_code,
+            value,
+            MOTION_SIMPLE_CMD_TYPE,
+        )
+
+    def send_simple_command(self, cmd_code: int, value: int = 0) -> None:
+        packet = self.pack_motion_simple_cmd(cmd_code, value)
+        try:
+            self._socket.sendto(packet, self._address)
+        except OSError as exc:
+            raise DriverSendError(str(exc)) from exc
 
     def send_cmd_vel(self, vx: float, vy: float, wz: float) -> None:
         self._reject_non_finite(vx, vy, wz)

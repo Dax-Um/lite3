@@ -43,7 +43,19 @@ lidar_process_exists() {
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     return 0
   fi
-  pgrep -af '/system/scripts/lidar/start_rslidar.sh([[:space:]]|$)|/rslidar_sdk_node([[:space:]]|$)|/rs_driver_node([[:space:]]|$)' >/dev/null
+  pgrep -af 'ros2 launch rslidar_sdk start.py|/system/scripts/lidar/start_rslidar.sh([[:space:]]|$)|/rslidar_sdk_node([[:space:]]|$)|/rs_driver_node([[:space:]]|$)' >/dev/null
+}
+
+stop_existing_lidar() {
+  pkill -TERM -f 'ros2 launch rslidar_sdk start.py|/system/scripts/lidar/start_rslidar.sh([[:space:]]|$)|/rslidar_sdk_node([[:space:]]|$)|/rs_driver_node([[:space:]]|$)' || true
+  for _ in $(seq 1 50); do
+    if ! lidar_process_exists; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "existing LiDAR process did not stop" >&2
+  return 1
 }
 
 if [ "$MODE" = "dry-run" ]; then
@@ -58,12 +70,8 @@ if [ "$MODE" = "dry-run" ]; then
 fi
 
 if lidar_process_exists; then
-  if lidar_is_fresh 15; then
-    echo "rslidar is publishing fresh /rslidar_points samples"
-    exit 0
-  fi
-  echo "LiDAR driver process exists but /rslidar_points is stale" >&2
-  exit 1
+  echo "stopping existing LiDAR process before restart"
+  stop_existing_lidar
 fi
 
 # A publisher may be running outside the vendor process names (for example in

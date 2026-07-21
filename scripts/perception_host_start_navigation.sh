@@ -69,12 +69,8 @@ if ! lidar_is_fresh; then
   echo "navigation start refused: /rslidar_points has no fresh samples" >&2
   exit 1
 fi
-if "$STATUS_SCRIPT" --execute; then
-  echo "navigation already running and ready"
-  exit 0
-fi
 if nav_process_exists; then
-  echo "partial navigation stack detected; stopping it before restart" >&2
+  echo "stopping existing navigation stack before restart" >&2
   "$STOP_SCRIPT" --execute
 fi
 

@@ -1,7 +1,7 @@
 motion_limits:
-  max_vx_mps: 0.20
+  max_vx_mps: 2.00
   max_vy_mps: 0.05
-  max_wz_radps: 0.20
+  max_wz_radps: 1.45
   test_duration_sec: 1.0
 
 timeouts:

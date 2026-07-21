@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import logging
 import io
-import subprocess
-import tempfile
 import uuid
-from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from lite3_mqtt.contract import (
     DetectionType,
     build_image_payload,
-    build_video_payload,
     image_topic,
-    video_topic,
 )
 
 
@@ -24,15 +19,6 @@ class AnnotatedMediaSource(Protocol):
 
     def capture_image(self, detection_type: DetectionType, event_id: str) -> bytes:
         """Return one annotated JPEG."""
-
-    def capture_video(
-        self,
-        detection_type: DetectionType,
-        event_id: str,
-        duration_ms: int,
-    ) -> bytes:
-        """Return an annotated MP4 clip covering duration_ms."""
-
 
 PublishJson = Callable[[str, dict], None]
 
@@ -43,15 +29,11 @@ class DetectionMediaPublisher:
         *,
         media_source: Optional[AnnotatedMediaSource],
         publish_json: PublishJson,
-        duration_ms: int = 5000,
         clock_ms: Optional[Callable[[], int]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        if duration_ms <= 0:
-            raise ValueError("duration_ms must be positive")
         self.media_source = media_source
         self.publish_json = publish_json
-        self.duration_ms = duration_ms
         self.clock_ms = clock_ms
         self.logger = logger or logging.getLogger(__name__)
 
@@ -72,21 +54,6 @@ class DetectionMediaPublisher:
             jpeg = None
         self.publish_image(detection_type, event_id=event_id, jpeg_bytes=jpeg)
 
-        try:
-            mp4 = self.media_source.capture_video(
-                detection_type,
-                event_id,
-                self.duration_ms,
-            )
-        except Exception:
-            self.logger.exception("annotated video capture failed event_id=%s", event_id)
-            mp4 = None
-        self.publish_video(
-            detection_type,
-            event_id=event_id,
-            mp4_bytes=mp4,
-            duration_ms=self.duration_ms,
-        )
         return event_id
 
     def publish_image(
@@ -106,29 +73,8 @@ class DetectionMediaPublisher:
             image_kwargs["clock_ms"] = self.clock_ms
         self.publish_json(image_topic(detection_type), build_image_payload(**image_kwargs))
 
-    def publish_video(
-        self,
-        detection_type: DetectionType,
-        *,
-        event_id: str,
-        mp4_bytes: Optional[bytes],
-        duration_ms: Optional[int] = None,
-    ) -> None:
-        """Publish one already-produced clip using the existing MQTT contract."""
-        actual_duration_ms = self.duration_ms if duration_ms is None else duration_ms
-        video_kwargs = {
-            "event_id": event_id,
-            "detection_type": detection_type,
-            "mp4_bytes": mp4_bytes,
-            "duration_ms": actual_duration_ms,
-        }
-        if self.clock_ms is not None:
-            video_kwargs["clock_ms"] = self.clock_ms
-        self.publish_json(video_topic(detection_type), build_video_payload(**video_kwargs))
-
-
 class MockAnnotatedMediaSource:
-    """Generate annotated JPEG with Pillow and MP4 with Foxy GStreamer."""
+    """Generate an annotated JPEG for bridge smoke tests."""
 
     def __init__(self, *, width: int = 640, height: int = 360, fps: int = 5) -> None:
         if width <= 0 or height <= 0 or fps <= 0:
@@ -139,67 +85,6 @@ class MockAnnotatedMediaSource:
 
     def capture_image(self, detection_type: DetectionType, event_id: str) -> bytes:
         return self._annotated_jpeg(detection_type, event_id)
-
-    def capture_video(
-        self,
-        detection_type: DetectionType,
-        event_id: str,
-        duration_ms: int,
-    ) -> bytes:
-        frame_count = max(1, round(self.fps * duration_ms / 1000.0))
-        temp_root = Path(tempfile.gettempdir())
-        token = uuid.uuid4().hex
-        jpeg_path = temp_root / "lite3-{}.jpg".format(token)
-        mp4_path = temp_root / "lite3-{}.mp4".format(token)
-        jpeg_path.write_bytes(self._annotated_jpeg(detection_type, event_id))
-        pipeline = [
-            "gst-launch-1.0",
-            "-q",
-            "filesrc",
-            "location={}".format(jpeg_path),
-            "!",
-            "jpegdec",
-            "!",
-            "imagefreeze",
-            "num-buffers={}".format(frame_count),
-            "!",
-            "videoconvert",
-            "!",
-            "video/x-raw,framerate={}/1,width={},height={}".format(
-                self.fps, self.width, self.height
-            ),
-            "!",
-            "x264enc",
-            "tune=zerolatency",
-            "speed-preset=ultrafast",
-            "key-int-max={}".format(self.fps),
-            "!",
-            "mp4mux",
-            "!",
-            "filesink",
-            "location={}".format(mp4_path),
-        ]
-        try:
-            completed = subprocess.run(
-                pipeline,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30.0,
-            )
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    "GStreamer mock MP4 failed: {}".format(
-                        completed.stderr.decode("utf-8", errors="replace")
-                    )
-                )
-            data = mp4_path.read_bytes()
-            if not data:
-                raise RuntimeError("mock MP4 is empty")
-            return data
-        finally:
-            jpeg_path.unlink(missing_ok=True)
-            mp4_path.unlink(missing_ok=True)
 
     def _annotated_jpeg(self, detection_type: DetectionType, event_id: str) -> bytes:
         try:

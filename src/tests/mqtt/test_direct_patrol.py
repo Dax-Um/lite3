@@ -74,6 +74,44 @@ def test_duplicate_start_does_not_create_second_patrol_thread(tmp_path):
     controller.close()
 
 
+def test_mission_home_can_be_captured_without_starting_auto_patrol(tmp_path):
+    backend = DirectMockPatrolBackend(
+        home=Waypoint("current", 3.0, -1.0, 0.25),
+    )
+    controller = DirectPatrolController(
+        backend=backend,
+        patrol_config=triangle_config(tmp_path),
+    )
+
+    assert controller.capture_home() is True
+    assert controller.home == Waypoint("home", 3.0, -1.0, 0.25)
+    assert controller.active is False
+
+
+def test_coyote_return_home_spins_then_calls_completion(tmp_path):
+    backend = DirectMockPatrolBackend(
+        home=Waypoint("home", 1.0, 2.0, 0.0),
+        route_duration_sec=0.01,
+    )
+    controller = DirectPatrolController(
+        backend=backend,
+        patrol_config=triangle_config(tmp_path),
+    )
+    assert controller.capture_home()
+    completed = []
+
+    assert controller.return_home(
+        spin_after_arrival=True,
+        on_complete=lambda: completed.append(True),
+    )
+    deadline = time.monotonic() + 1.0
+    while not completed and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert backend.spins == [pytest.approx(math.pi)]
+    assert completed == [True]
+
+
 def test_nav2_goal_uses_zero_stamp_across_unsynchronized_hosts(monkeypatch):
     class PoseStamped:
         def __init__(self):

@@ -15,11 +15,11 @@ from lite3_mqtt.coyote_bridge import (
     CoyoteMotionController,
     CoyoteSpoolReader,
 )
-from lite3_mqtt.contract import DetectionType, PatrolAction
+from lite3_mqtt.contract import DetectionType, InternalRosTopics, PatrolAction
+from lite3_motion.pointcloud_clearance import extract_clearances
 from lite3_perception.coyote_spool import (
     INTERNAL_IMAGE_TOPIC,
     INTERNAL_STATUS_TOPIC,
-    INTERNAL_VIDEO_TOPIC,
 )
 
 
@@ -38,20 +38,25 @@ try:
         ReliabilityPolicy,
         qos_profile_sensor_data,
     )
-    from sensor_msgs.msg import LaserScan
-    from std_msgs.msg import String, UInt64
+    from sensor_msgs.msg import LaserScan, PointCloud2
+    from std_msgs.msg import Int32, String, UInt64
 except ImportError:  # pragma: no cover
     rclpy = None
     Node = object  # type: ignore[misc, assignment]
     String = None
+    Int32 = None
 
 
 @dataclass(frozen=True)
 class CoyoteRosTopics:
     status_topic: str = INTERNAL_STATUS_TOPIC
+    complete_topic: str = "/lite3/data/coyote/complete"
     glass_status_topic: str = "/lite3/data/glass/status"
     image_topic: str = INTERNAL_IMAGE_TOPIC
-    video_topic: str = INTERNAL_VIDEO_TOPIC
+    # Direct IQ9 receiver; never depend on the perception-host motion_receiver.
+    robot_basic_state_topic: str = "/lite3/motion/robot_basic_state"
+    robot_motion_state_topic: str = "/lite3/motion/robot_motion_state"
+    motion_state_topic: str = "/lite3/motion/state"
 
 
 class CoyoteMotionOutputNode(Node):
@@ -75,7 +80,8 @@ class CoyoteMotionOutputNode(Node):
         *,
         cmd_vel_topic: str = "/cmd_vel",
         scan_topic: str = "/scan",
-        odom_topic: str = "/odom",
+        pointcloud_topic: str = "/rslidar_points",
+        motion_state_topic: str = "/lite3/motion/state",
         nav_idle_quiet_sec: float = 0.50,
         release_delay_sec: float = 0.25,
     ) -> None:
@@ -100,6 +106,7 @@ class CoyoteMotionOutputNode(Node):
         self.handoff_token = None  # type: Optional[int]
         self.handoff_acked = False
         self.next_handoff_publish = 0.0
+        self._last_pointcloud_clearance_log = 0.0
         self.watchdog_reset_pub = self.create_publisher(
             UInt64,
             "/lite3/nav/watchdog_reset",
@@ -117,7 +124,13 @@ class CoyoteMotionOutputNode(Node):
             self._on_scan,
             qos_profile_sensor_data,
         )
-        self.create_subscription(Odometry, odom_topic, self._on_odom, 10)
+        self.create_subscription(
+            PointCloud2,
+            pointcloud_topic,
+            self._on_pointcloud,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(String, motion_state_topic, self._on_motion_state, 10)
         status_qos = QoSProfile(depth=1)
         status_qos.reliability = ReliabilityPolicy.RELIABLE
         status_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -204,23 +217,46 @@ class CoyoteMotionOutputNode(Node):
         except Exception as exc:
             self.get_logger().error("coyote LaserScan rejected: {}".format(exc))
 
-    def _on_odom(self, message) -> None:
+    def _on_pointcloud(self, message) -> None:
+        """Translate perception-host RoboSense PointCloud2 into clearances."""
         if self.controller is None:
             return
-        position = message.pose.pose.position
-        orientation = message.pose.pose.orientation
-        yaw = math.atan2(
-            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
-            1.0 - 2.0 * (orientation.y * orientation.y + orientation.z * orientation.z),
-        )
         try:
+            front_m, left_m, right_m = extract_clearances(message)
+            self.controller.update_clearances(
+                front_m=front_m,
+                left_m=left_m,
+                right_m=right_m,
+            )
+            now = time.monotonic()
+            if now - self._last_pointcloud_clearance_log >= 2.0:
+                self._last_pointcloud_clearance_log = now
+                self.get_logger().info(
+                    "POINTCLOUD_CLEARANCE front=%s left=%s right=%s"
+                    % tuple(
+                        "%.2fm" % value if value is not None else "none"
+                        for value in (front_m, left_m, right_m)
+                    )
+                )
+        except Exception as exc:
+            self.get_logger().error("coyote PointCloud2 rejected: {}".format(exc))
+
+    def _on_motion_state(self, message) -> None:
+        if self.controller is None:
+            return
+        try:
+            payload = json.loads(message.data)
+            position = payload["pos_world"]
+            if not isinstance(position, list) or len(position) != 3:
+                raise ValueError("pos_world must have exactly three values")
+            yaw = float(payload["yaw_rad"])
             self.controller.update_odom(
-                float(position.x),
-                float(position.y),
+                float(position[0]),
+                float(position[1]),
                 yaw,
             )
         except Exception as exc:
-            self.get_logger().error("coyote odom rejected: {}".format(exc))
+            self.get_logger().error("coyote direct motion state rejected: {}".format(exc))
 
     def _status_callback(self, action_name: str):
         def on_status(message) -> None:
@@ -314,7 +350,6 @@ class CoyoteSpoolAdapterNode(Node):
         self.topics = topics or CoyoteRosTopics()
         self.status_pub = self.create_publisher(String, self.topics.status_topic, 10)
         self.image_pub = self.create_publisher(String, self.topics.image_topic, 10)
-        self.video_pub = self.create_publisher(String, self.topics.video_topic, 10)
         self.create_timer(poll_period_sec, self._poll)
 
     def _poll(self) -> None:
@@ -340,7 +375,9 @@ class CoyoteSpoolAdapterNode(Node):
             if manifest["kind"] == "image":
                 self.image_pub.publish(message)
             else:
-                self.video_pub.publish(message)
+                self.get_logger().warning(
+                    "unsupported coyote media kind: {}".format(manifest["kind"])
+                )
 
 
 class CoyoteMqttBridgeNode(Node):
@@ -353,6 +390,13 @@ class CoyoteMqttBridgeNode(Node):
         media_worker: CoyoteMediaWorker,
         motion_controller: CoyoteMotionController,
         search_events=None,
+        on_coyote_mission_start: Optional[Callable[[str], None]] = None,
+        on_coyote_home_reached: Optional[Callable[[str], None]] = None,
+        on_robot_basic_state: Optional[Callable[[int], None]] = None,
+        on_robot_motion_state: Optional[Callable[[int], None]] = None,
+        on_motion_state: Optional[Callable[[dict], None]] = None,
+        on_coyote_status: Optional[Callable[[object], None]] = None,
+        on_coyote_complete_event: Optional[Callable[[str, str], None]] = None,
         topics: Optional[CoyoteRosTopics] = None,
         control_hz: float = 20.0,
     ) -> None:
@@ -365,11 +409,35 @@ class CoyoteMqttBridgeNode(Node):
         self.media_worker = media_worker
         self.motion_controller = motion_controller
         self.search_events = search_events
+        self.on_coyote_mission_start = on_coyote_mission_start
+        self.on_coyote_home_reached = on_coyote_home_reached
+        self.on_robot_basic_state = on_robot_basic_state
+        self.on_robot_motion_state = on_robot_motion_state
+        self.on_motion_state = on_motion_state
+        self.on_coyote_status = on_coyote_status
+        self.on_coyote_complete_event = on_coyote_complete_event
         self.topics = topics or CoyoteRosTopics()
+        self._last_motion_trace = None
+        self.mission_event_pub = self.create_publisher(
+            String,
+            InternalRosTopics.MISSION_EVENT,
+            10,
+        )
+        self.coyote_complete_pub = self.create_publisher(
+            String,
+            self.topics.complete_topic,
+            10,
+        )
         self.create_subscription(
             String,
             self.topics.status_topic,
             self._on_coyote_status,
+            10,
+        )
+        self.create_subscription(
+            String,
+            self.topics.complete_topic,
+            self._on_coyote_complete_event,
             10,
         )
         self.create_subscription(
@@ -379,26 +447,185 @@ class CoyoteMqttBridgeNode(Node):
             10,
         )
         self.create_subscription(String, self.topics.image_topic, self._on_image, 10)
-        self.create_subscription(String, self.topics.video_topic, self._on_video, 10)
+        self.create_subscription(
+            Int32,
+            self.topics.robot_basic_state_topic,
+            self._on_robot_basic_state,
+            10,
+        )
+        self.create_subscription(
+            Int32,
+            self.topics.robot_motion_state_topic,
+            self._on_robot_motion_state,
+            10,
+        )
+        self.create_subscription(
+            String,
+            self.topics.motion_state_topic,
+            self._on_motion_state,
+            10,
+        )
+        self.create_subscription(
+            String,
+            InternalRosTopics.MISSION_START,
+            self._on_mission_start,
+            10,
+        )
+        self.create_subscription(
+            String,
+            InternalRosTopics.MISSION_HOME_REACHED,
+            self._on_mission_home_reached,
+            10,
+        )
         self.create_timer(1.0 / control_hz, self._tick_motion)
 
     def _on_coyote_status(self, message) -> None:
         self._handle_status(message, DetectionType.COYOTE)
+
+    def publish_coyote_complete_event(self, event_id: str, completion_reason: str) -> None:
+        """Publish the terminal Coyote handoff before any completion motion."""
+        message = String()
+        message.data = json.dumps(
+            {
+                "event_id": event_id,
+                "completion_reason": completion_reason,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.coyote_complete_pub.publish(message)
+        self.get_logger().info(
+            "coyote COMPLETE ROS event published topic={} event_id={} reason={}".format(
+                self.topics.complete_topic,
+                event_id,
+                completion_reason,
+            )
+        )
+
+    def _on_coyote_complete_event(self, message) -> None:
+        try:
+            event = json.loads(message.data)
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("event_id"), str)
+                or not event["event_id"]
+                or not isinstance(event.get("completion_reason"), str)
+                or not event["completion_reason"]
+            ):
+                raise ValueError("invalid coyote COMPLETE event")
+            if self.on_coyote_complete_event is None:
+                raise RuntimeError("coyote COMPLETE handler is not configured")
+            self.on_coyote_complete_event(
+                event["event_id"],
+                event["completion_reason"],
+            )
+        except Exception as exc:
+            self.get_logger().error("coyote COMPLETE event rejected: {}".format(exc))
 
     def _on_glass_status(self, message) -> None:
         self._handle_status(message, DetectionType.BROKEN_CUP)
 
     def _handle_status(self, message, detection_type: DetectionType) -> None:
         try:
-            self.motion_controller.handle_status(message.data, detection_type)
+            status = self.motion_controller.handle_status(message.data, detection_type)
         except Exception as exc:
             self.get_logger().error("coyote status rejected: {}".format(exc))
+            return
+        if detection_type is DetectionType.COYOTE and self.on_coyote_status is not None:
+            try:
+                self.on_coyote_status(status)
+            except Exception as exc:
+                # An auxiliary observer (for example RealSense return-vector
+                # capture) must never interrupt the primary motion stream.
+                self.get_logger().error("coyote status observer failed: {}".format(exc))
 
     def _on_image(self, message) -> None:
         self._submit_manifest(message.data, expected_kind="image")
 
-    def _on_video(self, message) -> None:
-        self._submit_manifest(message.data, expected_kind="video")
+    def _on_robot_basic_state(self, message) -> None:
+        if self.on_robot_basic_state is None:
+            return
+        try:
+            self.on_robot_basic_state(int(message.data))
+        except Exception as exc:
+            self.get_logger().error("robot basic state rejected: {}".format(exc))
+
+    def _on_robot_motion_state(self, message) -> None:
+        if self.on_robot_motion_state is None:
+            return
+        try:
+            self.on_robot_motion_state(int(message.data))
+        except Exception as exc:
+            self.get_logger().error("robot motion state rejected: {}".format(exc))
+
+    def _on_motion_state(self, message) -> None:
+        if self.on_motion_state is None:
+            return
+        try:
+            payload = json.loads(message.data)
+            if not isinstance(payload, dict):
+                raise ValueError("motion state must be a JSON object")
+            self.on_motion_state(payload)
+        except Exception as exc:
+            self.get_logger().error("robot motion payload rejected: {}".format(exc))
+
+    def _on_mission_start(self, message) -> None:
+        try:
+            event = json.loads(message.data)
+            if (
+                not isinstance(event, dict)
+                or event.get("source") != "coyote"
+                or event.get("requested_action") != "START_SEARCH"
+                or not isinstance(event.get("event_id"), str)
+                or not event["event_id"]
+            ):
+                return
+            if self.on_coyote_mission_start is None:
+                raise RuntimeError("coyote mission start handler is not configured")
+            self.on_coyote_mission_start(event["event_id"])
+        except Exception as exc:
+            self.get_logger().error("coyote mission start rejected: {}".format(exc))
+
+    def _on_mission_home_reached(self, message) -> None:
+        try:
+            event = json.loads(message.data)
+            if (
+                not isinstance(event, dict)
+                or event.get("source") != "coyote"
+                or event.get("state") != "HOME_REACHED"
+                or not isinstance(event.get("event_id"), str)
+                or not event["event_id"]
+            ):
+                return
+            if self.on_coyote_home_reached is None:
+                raise RuntimeError("coyote home-reached handler is not configured")
+            self.on_coyote_home_reached(event["event_id"])
+        except Exception as exc:
+            self.get_logger().error("coyote home-reached rejected: {}".format(exc))
+
+    def publish_return_home_request(self, event_id: str, *, source: str) -> None:
+        """Handoff only after a detection motion session reaches COMPLETE."""
+        if source not in {"coyote", "broken_cup"}:
+            raise ValueError("unsupported mission event source")
+        message = String()
+        message.data = json.dumps(
+            {
+                "event_id": event_id,
+                "source": source,
+                "state": "COMPLETED",
+                "requested_action": "RETURN_HOME",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.mission_event_pub.publish(message)
+        self.get_logger().info(
+            "mission event published topic={} source={} event_id={} action=RETURN_HOME".format(
+                InternalRosTopics.MISSION_EVENT,
+                source,
+                event_id,
+            )
+        )
 
     def _submit_manifest(self, body: str, *, expected_kind: str) -> None:
         try:
@@ -468,7 +695,15 @@ class CoyoteMqttBridgeNode(Node):
             # non-zero command in the same control callback.
             if stop_barrier:
                 return
-            self.motion_controller.tick()
+            command = self.motion_controller.tick()
+            trace = (self.motion_controller.last_reason, command)
+            if trace != self._last_motion_trace:
+                self._last_motion_trace = trace
+                self.get_logger().info(
+                    "coyote motion reason={} cmd_vel=({}, {}, {})".format(
+                        trace[0], trace[1][0], trace[1][1], trace[1][2]
+                    )
+                )
         except Exception as exc:
             self.get_logger().error("coyote motion output failed: {}".format(exc))
 

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from lite3_mqtt.contract import Topics, compact_json
 
@@ -116,6 +117,12 @@ class PahoMqttClient:
         info.wait_for_publish(timeout=self.config.publish_timeout_sec)
         if not info.is_published():
             raise TimeoutError(f"MQTT publish timed out topic={topic}")
+        self._logger.info(
+            "MQTT TX client_id=%s topic=%s qos=0 payload=%s",
+            self.config.client_id,
+            topic,
+            _payload_summary(body),
+        )
 
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
         _ = userdata, flags, properties
@@ -161,7 +168,8 @@ class PahoMqttClient:
             return
         self._connected.set()
         self._logger.info(
-            "MQTT connected and subscribed to %s",
+            "MQTT SUB client_id=%s topics=%s",
+            self.config.client_id,
             self.config.subscriptions,
         )
 
@@ -188,6 +196,13 @@ class PahoMqttClient:
         if bool(getattr(message, "retain", False)):
             self._logger.warning("retained MQTT command ignored topic=%s", message.topic)
             return
+        self._logger.info(
+            "MQTT RX client_id=%s topic=%s qos=%s payload=%s",
+            self.config.client_id,
+            message.topic,
+            message.qos,
+            _payload_summary(bytes(message.payload)),
+        )
         try:
             self._message_callback(str(message.topic), bytes(message.payload))
         except Exception:
@@ -197,3 +212,26 @@ class PahoMqttClient:
                 "MQTT message callback failed topic=%s",
                 message.topic,
             )
+
+
+def _payload_summary(body: bytes) -> str:
+    """Return a bounded JSON log view without writing base64 media to logs."""
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "<{} raw bytes>".format(len(body))
+    return json.dumps(_redact_media(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def _redact_media(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if key in {"data_base64", "snapshot"} and isinstance(item, str):
+                redacted[key] = "<{} base64 chars>".format(len(item))
+            else:
+                redacted[key] = _redact_media(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_media(item) for item in value]
+    return value

@@ -8,5 +8,6 @@ fi
 
 # The generated setup file also chains the ROS Foxy underlay used at build time.
 source /opt/lite3_overlay/setup.bash
+source /opt/lite3_realsense/setup.bash
 mkdir -p /tmp/ros/launch /tmp/ros/mqtt /tmp/ros/coyote
 exec "$@"

@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Callable, Dict, Optional, Union
 
 from lite3_mqtt.patrol import PatrolConfig, Waypoint, WaypointRoute
 
@@ -81,7 +81,34 @@ class DirectPatrolController:
         """Detection owns a different path; do not probe or mutate Nav2 here."""
         self.stop()
 
-    def return_home(self) -> bool:
+    def capture_home(self) -> bool:
+        """Save the current Nav2 pose without starting an auto-patrol route."""
+        with self._lock:
+            if self._emergency_latched:
+                return False
+        try:
+            home = self.backend.capture_current_pose(waypoint_id="home")
+        except Exception:
+            self.logger.exception("mission home capture failed")
+            return False
+        with self._lock:
+            if self._emergency_latched:
+                return False
+            self._home = home
+        self.logger.info(
+            "mission home captured x=%.3f y=%.3f yaw=%.3f",
+            home.x,
+            home.y,
+            home.yaw,
+        )
+        return True
+
+    def return_home(
+        self,
+        *,
+        spin_after_arrival: bool = False,
+        on_complete: Optional[Callable[[], None]] = None,
+    ) -> bool:
         with self._lock:
             home = self._home
             active = self._thread
@@ -90,7 +117,7 @@ class DirectPatrolController:
         self.stop()
         thread = threading.Thread(
             target=self._return_home,
-            args=(active, home),
+            args=(active, home, spin_after_arrival, on_complete),
             name="mqtt-direct-return-home",
             daemon=True,
         )
@@ -153,7 +180,13 @@ class DirectPatrolController:
                     self._thread = None
             self.logger.info("patrol loop stopped")
 
-    def _return_home(self, active, home: Waypoint) -> None:
+    def _return_home(
+        self,
+        active,
+        home: Waypoint,
+        spin_after_arrival: bool,
+        on_complete: Optional[Callable[[], None]],
+    ) -> None:
         if active is not None:
             active.join(timeout=5.0)
             if active.is_alive():
@@ -172,6 +205,18 @@ class DirectPatrolController:
             result = self.backend.send_route(route)
             if not _succeeded(result):
                 self.logger.error("return-home route failed: %s", result)
+                return
+            if spin_after_arrival:
+                spin = getattr(self.backend, "spin", None)
+                if not callable(spin):
+                    self.logger.error("return-home spin requested but backend has no spin()")
+                    return
+                result = spin(math.pi)
+                if not _succeeded(result):
+                    self.logger.error("return-home 180-degree spin failed: %s", result)
+                    return
+            if on_complete is not None:
+                on_complete()
         except Exception:
             self.logger.exception("return-home failed")
 
@@ -186,6 +231,7 @@ class DirectMockPatrolBackend:
         self.current_pose = home or Waypoint("home", 0.0, 0.0, 0.0)
         self.route_duration_sec = route_duration_sec
         self.routes = []
+        self.spins = []
         self._cancel = threading.Event()
 
     def prepare_route(self) -> None:
@@ -203,6 +249,12 @@ class DirectMockPatrolBackend:
 
     def cancel_active(self) -> None:
         self._cancel.set()
+
+    def spin(self, target_yaw: float) -> Dict[str, object]:
+        self.spins.append(float(target_yaw))
+        if self._cancel.is_set():
+            return _canceled_result(True, 0)
+        return {"accepted": True, "status": 4, "missed_waypoints": []}
 
 
 class DirectNav2PatrolBackend:
@@ -380,6 +432,47 @@ class DirectNav2PatrolBackend:
 
     def cancel_active(self) -> None:
         self._cancel.set()
+
+    def spin(self, target_yaw: float) -> Dict[str, object]:
+        import rclpy
+        from nav2_msgs.action import Spin
+        from rclpy.action import ActionClient
+
+        rclpy.init(args=None)
+        node = rclpy.create_node("lite3_direct_return_home_spin")
+        client = ActionClient(node, Spin, "/spin")
+        deadline = time.monotonic() + self.route_timeout_sec
+        try:
+            if not client.wait_for_server(timeout_sec=self.timeout_sec):
+                raise TimeoutError("/spin action server is unavailable")
+            if self._cancel.is_set():
+                return _canceled_result(False, 0)
+            goal = Spin.Goal()
+            goal.target_yaw = float(target_yaw)
+            send_future = client.send_goal_async(goal)
+            while rclpy.ok() and not send_future.done():
+                rclpy.spin_once(node, timeout_sec=0.05)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("/spin goal acceptance timed out")
+            goal_handle = send_future.result()
+            if goal_handle is None or not goal_handle.accepted:
+                return {"accepted": False, "status": None, "missed_waypoints": []}
+            result_future = goal_handle.get_result_async()
+            while rclpy.ok() and not result_future.done():
+                rclpy.spin_once(node, timeout_sec=0.05)
+                if self._cancel.is_set():
+                    goal_handle.cancel_goal_async()
+                    return _canceled_result(True, 0)
+                if time.monotonic() >= deadline:
+                    goal_handle.cancel_goal_async()
+                    return {"accepted": True, "status": "TIMEOUT", "missed_waypoints": []}
+            wrapped = result_future.result()
+            status = None if wrapped is None else wrapped.status
+            return {"accepted": True, "status": status, "missed_waypoints": []}
+        finally:
+            client.destroy()
+            node.destroy_node()
+            rclpy.shutdown()
 
 
 def _pose_stamped(node, frame_id: str, waypoint: Waypoint):

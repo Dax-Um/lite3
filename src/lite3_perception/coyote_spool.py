@@ -15,7 +15,6 @@ from typing import Any, Callable, Dict, Optional, Union
 
 INTERNAL_STATUS_TOPIC = "/lite3/data/coyote/status"
 INTERNAL_IMAGE_TOPIC = "/lite3/data/coyote/image"
-INTERNAL_VIDEO_TOPIC = "/lite3/data/coyote/video"
 
 _EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _JPEG_START = b"\xff\xd8"
@@ -26,13 +25,10 @@ _JPEG_END = b"\xff\xd9"
 class CoyoteSpoolConfig:
     root: Path
     max_image_bytes: int = 8 * 1024 * 1024
-    # Keep headroom for base64 expansion plus the JSON envelope under the
-    # MQTT client's 48 MiB payload cap.
-    max_video_bytes: int = 35 * 1024 * 1024
 
     def __post_init__(self) -> None:
-        if self.max_image_bytes <= 0 or self.max_video_bytes <= 0:
-            raise ValueError("spool media limits must be positive")
+        if self.max_image_bytes <= 0:
+            raise ValueError("spool image limit must be positive")
 
 
 class CoyoteMediaSpool:
@@ -98,72 +94,29 @@ class CoyoteMediaSpool:
         _atomic_write_json(event_dir / "image.ready.json", manifest)
         return manifest
 
-    def write_video(
-        self,
-        event_id: str,
-        mp4_bytes: Union[bytes, bytearray],
-        *,
-        duration_ms: int,
-        capture_started_at_ms: Optional[int] = None,
-        capture_ended_at_ms: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        event_id = validate_event_id(event_id)
-        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms <= 0:
-            raise ValueError("duration_ms must be a positive integer")
-        data = bytes(mp4_bytes)
-        if not _is_mp4(data):
-            raise ValueError("coyote video must be a complete MP4")
-        if len(data) > self.config.max_video_bytes:
-            raise ValueError("coyote video exceeds spool size limit")
-        event_dir = self._event_dir(event_id)
-        _ensure_new_artifact(event_dir, "video")
-        media_path = event_dir / "video.mp4"
-        _atomic_write(media_path, data)
-        manifest = self._manifest(
-            event_id=event_id,
-            kind="video",
-            media_path=media_path,
-            media_format="mp4",
-            data=data,
-            duration_ms=duration_ms,
-            capture_started_at_ms=capture_started_at_ms,
-            capture_ended_at_ms=capture_ended_at_ms,
-        )
-        _atomic_write_json(event_dir / "video.ready.json", manifest)
-        return manifest
-
     def write_failure(
         self,
         event_id: str,
         kind: str,
         *,
         reason: str,
-        duration_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Queue a contract-level FAIL without inventing invalid media bytes."""
         event_id = validate_event_id(event_id)
-        if kind not in ("image", "video"):
-            raise ValueError("coyote media kind must be image or video")
-        if kind == "video" and (
-            isinstance(duration_ms, bool)
-            or not isinstance(duration_ms, int)
-            or duration_ms <= 0
-        ):
-            raise ValueError("video failure requires a positive duration_ms")
+        if kind != "image":
+            raise ValueError("coyote media kind must be image")
         event_dir = self._event_dir(event_id)
         _ensure_new_artifact(event_dir, kind)
         manifest = {
             "version": 1,
             "event_id": event_id,
             "kind": kind,
-            "topic": INTERNAL_IMAGE_TOPIC if kind == "image" else INTERNAL_VIDEO_TOPIC,
-            "format": "jpeg" if kind == "image" else "mp4",
+            "topic": INTERNAL_IMAGE_TOPIC,
+            "format": "jpeg",
             "result": "FAIL",
             "failure_reason": str(reason)[:512],
             "created_at": int(self._clock_ms()),
         }  # type: Dict[str, Any]
-        if duration_ms is not None:
-            manifest["duration_ms"] = int(duration_ms)
         _atomic_write_json(event_dir / "{}.ready.json".format(kind), manifest)
         return manifest
 
@@ -181,17 +134,12 @@ class CoyoteMediaSpool:
         media_format: str,
         data: bytes,
         source_timestamp_ms: Optional[int] = None,
-        duration_ms: Optional[int] = None,
-        capture_started_at_ms: Optional[int] = None,
-        capture_ended_at_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         manifest = {
             "version": 1,
             "event_id": event_id,
             "kind": kind,
-            "topic": (
-                INTERNAL_IMAGE_TOPIC if kind == "image" else INTERNAL_VIDEO_TOPIC
-            ),
+            "topic": INTERNAL_IMAGE_TOPIC,
             "format": media_format,
             "result": "SUCCESS",
             "path": str(media_path.resolve()),
@@ -201,12 +149,6 @@ class CoyoteMediaSpool:
         }  # type: Dict[str, Any]
         if source_timestamp_ms is not None:
             manifest["source_timestamp"] = int(source_timestamp_ms)
-        if duration_ms is not None:
-            manifest["duration_ms"] = int(duration_ms)
-        if capture_started_at_ms is not None:
-            manifest["capture_started_at"] = int(capture_started_at_ms)
-        if capture_ended_at_ms is not None:
-            manifest["capture_ended_at"] = int(capture_ended_at_ms)
         return manifest
 
 
@@ -214,10 +156,6 @@ def validate_event_id(event_id: str) -> str:
     if not isinstance(event_id, str) or not _EVENT_ID.fullmatch(event_id):
         raise ValueError("event_id contains unsupported characters or length")
     return event_id
-
-
-def _is_mp4(data: bytes) -> bool:
-    return len(data) >= 12 and data[4:8] == b"ftyp"
 
 
 def _ensure_new_artifact(event_dir: Path, kind: str) -> None:

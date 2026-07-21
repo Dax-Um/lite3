@@ -11,11 +11,32 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-ugly \
+        build-essential \
+        cmake \
+        curl \
+        git \
+        libudev-dev \
+        libusb-1.0-0-dev \
+        pkg-config \
         openssh-client \
         python3-pil \
+        ros-foxy-cv-bridge \
+        ros-foxy-diagnostic-updater \
+        ros-foxy-image-transport \
         ros-foxy-pointcloud-to-laserscan \
         ros-foxy-rmw-cyclonedds-cpp \
     && rm -rf /var/lib/apt/lists/*
+
+ARG LIBREALSENSE_VERSION=v2.55.1
+ARG REALSENSE_ROS_VERSION=4.55.1
+RUN git clone --depth 1 --branch ${LIBREALSENSE_VERSION} https://github.com/IntelRealSense/librealsense.git /tmp/librealsense \
+    && cmake -S /tmp/librealsense -B /tmp/librealsense/build -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_GRAPHICAL_EXAMPLES=OFF -DBUILD_PYTHON_BINDINGS=OFF -DFORCE_RSUSB_BACKEND=ON \
+    && cmake --build /tmp/librealsense/build --parallel 2 && cmake --install /tmp/librealsense/build \
+    && ldconfig && rm -rf /tmp/librealsense
+RUN git clone --depth 1 --branch ${REALSENSE_ROS_VERSION} https://github.com/IntelRealSense/realsense-ros.git /tmp/realsense-ros \
+    && . /opt/ros/foxy/setup.sh \
+    && colcon build --base-paths /tmp/realsense-ros --install-base /opt/lite3_realsense --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    && rm -rf /tmp/realsense-ros
 
 COPY requirements.foxy.txt /tmp/lite3-mqtt-requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/lite3-mqtt-requirements.txt

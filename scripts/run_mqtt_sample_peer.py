@@ -79,9 +79,8 @@ def main(argv=None) -> int:
             result, mid = inner.subscribe(
                 [
                     (Topics.BROKEN_CUP_IMAGE, 0),
-                    (Topics.BROKEN_CUP_VIDEO, 0),
                     (Topics.COYOTE_IMAGE, 0),
-                    (Topics.COYOTE_VIDEO, 0),
+                    (Topics.COYOTE_COMPLETE, 0),
                 ]
             )
             if result == 0:
@@ -154,9 +153,7 @@ def _scenario(
         _publish(client, topic, payload)
     expected = {
         Topics.BROKEN_CUP_IMAGE,
-        Topics.BROKEN_CUP_VIDEO,
         Topics.COYOTE_IMAGE,
-        Topics.COYOTE_VIDEO,
     }
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -168,14 +165,6 @@ def _scenario(
     if not expected.issubset(set(topics)):
         print(json.dumps({"scenario": "FAIL", "missing_topics": sorted(expected - set(topics))}))
         return 1
-    if topics.index(Topics.BROKEN_CUP_IMAGE) > topics.index(Topics.BROKEN_CUP_VIDEO):
-        print(json.dumps({"scenario": "FAIL", "reason": "broken-cup video arrived first"}))
-        return 1
-    if topics.index(Topics.COYOTE_IMAGE) > topics.index(Topics.COYOTE_VIDEO):
-        print(json.dumps({"scenario": "FAIL", "reason": "coyote video arrived first"}))
-        return 1
-    _validate_event_pair(received, Topics.BROKEN_CUP_IMAGE, Topics.BROKEN_CUP_VIDEO)
-    _validate_event_pair(received, Topics.COYOTE_IMAGE, Topics.COYOTE_VIDEO)
     print(
         json.dumps(
             {
@@ -240,18 +229,9 @@ def _publish(client, topic, payload) -> None:
         raise TimeoutError("sample MQTT publish timed out topic={}".format(topic))
 
 
-def _validate_event_pair(received, image_topic, video_topic):
-    image_payload = next(payload for topic, payload in received if topic == image_topic)
-    video_payload = next(payload for topic, payload in received if topic == video_topic)
-    if image_payload["event_id"] != video_payload["event_id"]:
-        raise RuntimeError(f"event_id mismatch for {image_topic} and {video_topic}")
-    if image_payload["result"] != "SUCCESS" or video_payload["result"] != "SUCCESS":
-        raise RuntimeError(f"media generation failed for event_id={image_payload['event_id']}")
-
-
 def _summary(payload):
     summary = dict(payload)
-    for field in ("image", "video"):
+    for field in ("image",):
         media = summary.get(field)
         if isinstance(media, dict) and "data_base64" in media:
             media = dict(media)

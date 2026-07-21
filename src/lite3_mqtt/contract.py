@@ -16,11 +16,18 @@ class Topics:
     COYOTE_DETECT = "/lite3/data/coyote_detect"
 
     BROKEN_CUP_IMAGE = "/aicenter/data/broken_cup_image"
-    BROKEN_CUP_VIDEO = "/aicenter/data/broken_cup_video"
     COYOTE_IMAGE = "/aicenter/data/coyote_image"
-    COYOTE_VIDEO = "/aicenter/data/coyote_video"
+    COYOTE_COMPLETE = "/aicenter/data/coyote_complete"
 
     SUBSCRIPTIONS = (AUTO_PATROL, SOUND_DETECT, COYOTE_DETECT)
+
+
+class InternalRosTopics:
+    """Private ROS 2 coordination topics; never exposed through MQTT."""
+
+    MISSION_EVENT = "/lite3/internal/mission_event"
+    MISSION_START = "/lite3/internal/mission_start"
+    MISSION_HOME_REACHED = "/lite3/internal/mission_home_reached"
 
 
 class PatrolAction(str, Enum):
@@ -39,6 +46,7 @@ class DetectionType(str, Enum):
 class Result(str, Enum):
     SUCCESS = "SUCCESS"
     FAIL = "FAIL"
+    COMPLETE = "COMPLETE"
 
 
 @dataclass(frozen=True)
@@ -126,28 +134,20 @@ def build_image_payload(
     }
 
 
-def build_video_payload(
+def build_coyote_complete_payload(
     *,
     event_id: str,
-    detection_type: DetectionType,
-    mp4_bytes: Union[bytes, None],
-    duration_ms: int,
+    completion_reason: str = "TARGET_REACHED",
     clock_ms: Callable[[], int] = epoch_ms,
 ) -> Dict[str, Any]:
-    event_id = _validated_event_id(event_id)
-    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms <= 0:
-        raise ValueError("duration_ms must be a positive integer")
-    success = _is_mp4(mp4_bytes)
+    if completion_reason not in {"TARGET_REACHED", "NOT_FOUND"}:
+        raise ValueError("completion_reason must be TARGET_REACHED or NOT_FOUND")
     return {
-        "event_id": event_id,
+        "event_id": _validated_event_id(event_id),
         "timestamp": int(clock_ms()),
-        "event_type": detection_type.value,
-        "result": Result.SUCCESS.value if success else Result.FAIL.value,
-        "video": {
-            "format": "mp4",
-            "duration_ms": int(duration_ms),
-            "data_base64": _base64(mp4_bytes if success else None),
-        },
+        "event_type": "COYOTE_DETECTED",
+        "result": Result.COMPLETE.value,
+        "completion_reason": completion_reason,
     }
 
 
@@ -156,14 +156,6 @@ def image_topic(detection_type: DetectionType) -> str:
         return Topics.BROKEN_CUP_IMAGE
     if detection_type is DetectionType.COYOTE:
         return Topics.COYOTE_IMAGE
-    raise ValueError("unsupported detection type: {!r}".format(detection_type))
-
-
-def video_topic(detection_type: DetectionType) -> str:
-    if detection_type is DetectionType.BROKEN_CUP:
-        return Topics.BROKEN_CUP_VIDEO
-    if detection_type is DetectionType.COYOTE:
-        return Topics.COYOTE_VIDEO
     raise ValueError("unsupported detection type: {!r}".format(detection_type))
 
 
@@ -186,10 +178,6 @@ def _validated_event_id(event_id: str) -> str:
 
 def _is_jpeg(data: Union[bytes, None]) -> bool:
     return bool(data and len(data) >= 4 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9")
-
-
-def _is_mp4(data: Union[bytes, None]) -> bool:
-    return bool(data and len(data) >= 12 and data[4:8] == b"ftyp")
 
 
 def _required_string(value: Dict[str, Any], key: str) -> str:

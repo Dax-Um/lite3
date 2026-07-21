@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -17,7 +18,12 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 from lite3_mqtt.client import MqttConfig, PahoMqttClient  # noqa: E402
-from lite3_mqtt.contract import Topics, parse_detection_trigger  # noqa: E402
+from lite3_mqtt.contract import (  # noqa: E402
+    DetectionType,
+    InternalRosTopics,
+    Topics,
+    parse_detection_trigger,
+)
 from lite3_mqtt.media import DetectionMediaPublisher, MockAnnotatedMediaSource  # noqa: E402
 from lite3_mqtt.direct_patrol import (  # noqa: E402
     DirectMockPatrolBackend,
@@ -31,6 +37,84 @@ from lite3_mqtt.runtime import Lite3MqttRuntime  # noqa: E402
 
 
 DEFAULT_PATROL_CONFIG = ROOT / "configs" / "routes" / "mqtt_triangle_patrol.yaml"
+
+
+class InternalMissionEventSubscriber:
+    """Receive private ROS mission transitions in a context separate from Nav2 calls."""
+
+    def __init__(self, runtime: Lite3MqttRuntime, logger: logging.Logger) -> None:
+        import rclpy
+        from rclpy.context import Context
+        from rclpy.executors import SingleThreadedExecutor
+        from std_msgs.msg import String
+
+        self._rclpy = rclpy
+        self._runtime = runtime
+        self._context = Context()
+        rclpy.init(args=None, context=self._context)
+        self._node = rclpy.create_node(
+            "lite3_internal_mission_receiver",
+            context=self._context,
+        )
+        self._node.create_subscription(
+            String,
+            InternalRosTopics.MISSION_EVENT,
+            lambda message: runtime.handle_mission_event(
+                message.data,
+                on_coyote_home_reached=self.publish_coyote_home_reached,
+            ),
+            10,
+        )
+        self._mission_start_pub = self._node.create_publisher(
+            String,
+            InternalRosTopics.MISSION_START,
+            10,
+        )
+        self._home_reached_pub = self._node.create_publisher(
+            String,
+            InternalRosTopics.MISSION_HOME_REACHED,
+            10,
+        )
+        self._executor = SingleThreadedExecutor(context=self._context)
+        self._executor.add_node(self._node)
+        self._thread = threading.Thread(
+            target=self._executor.spin,
+            name="lite3-internal-mission-receiver",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info("internal mission subscriber ready topic=%s", InternalRosTopics.MISSION_EVENT)
+
+    def publish_coyote_start(self, event_id: str) -> None:
+        from std_msgs.msg import String
+
+        message = String()
+        message.data = json.dumps(
+            {
+                "event_id": event_id,
+                "source": "coyote",
+                "requested_action": "START_SEARCH",
+            },
+            separators=(",", ":"),
+        )
+        self._mission_start_pub.publish(message)
+
+    def publish_coyote_home_reached(self, event_id: str) -> None:
+        from std_msgs.msg import String
+
+        message = String()
+        message.data = json.dumps(
+            {"event_id": event_id, "source": "coyote", "state": "HOME_REACHED"},
+            separators=(",", ":"),
+        )
+        self._home_reached_pub.publish(message)
+        self._runtime.release_coyote_mission(event_id)
+
+    def close(self) -> None:
+        self._executor.shutdown()
+        self._node.destroy_node()
+        self._rclpy.shutdown(context=self._context)
+        self._thread.join(timeout=2.0)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -60,11 +144,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=0,
         help="0 repeats forever; use 1 for the first physical movement test.",
     )
-    parser.add_argument("--video-duration-ms", type=int, default=5000)
     parser.add_argument(
         "--mock-detection-media",
         action="store_true",
-        help="publish generated test image/video directly from MQTT triggers",
+        help="publish a generated test image directly from MQTT triggers",
     )
     parser.add_argument("--run-seconds", type=float, default=0.0)
     parser.add_argument("--log-level", default="INFO")
@@ -121,6 +204,36 @@ def main(argv=None) -> int:
                 trigger.event_id,
                 trigger.detection_type.value,
             )
+            if trigger.detection_type is DetectionType.COYOTE:
+                runtime = runtime_holder["runtime"]
+                if not runtime.reserve_coyote_mission(trigger.event_id):
+                    logger.info(
+                        "coyote mission trigger ignored while another mission is active event_id=%s",
+                        trigger.event_id,
+                    )
+                    return
+                if not patrol.capture_home():
+                    runtime.release_coyote_mission(trigger.event_id)
+                    logger.error(
+                        "coyote mission rejected: unable to capture home event_id=%s",
+                        trigger.event_id,
+                    )
+                    return
+                logger.info(
+                    "coyote mission home captured; IQ9 coyote search starts independently event_id=%s",
+                    trigger.event_id,
+                )
+                return
+            if trigger.detection_type is DetectionType.BROKEN_CUP:
+                published = runtime_holder["runtime"].report_detection(
+                    trigger.detection_type,
+                    event_id=trigger.event_id,
+                )
+                logger.info(
+                    "broken-cup image requested event_id=%s accepted=%s",
+                    trigger.event_id,
+                    published,
+                )
             return
         runtime_holder["runtime"].handle_message(topic, payload)
 
@@ -149,7 +262,6 @@ def main(argv=None) -> int:
     media_publisher = DetectionMediaPublisher(
         media_source=MockAnnotatedMediaSource(),
         publish_json=client.publish_json,
-        duration_ms=args.video_duration_ms,
         logger=logger,
     )
     runtime = Lite3MqttRuntime(
@@ -160,6 +272,7 @@ def main(argv=None) -> int:
         logger=logger,
     )
     runtime_holder["runtime"] = runtime
+    mission_subscriber = InternalMissionEventSubscriber(runtime, logger)
 
     def request_stop(signum=None, frame=None) -> None:
         _ = signum, frame
@@ -185,6 +298,10 @@ def main(argv=None) -> int:
     finally:
         if timer is not None:
             timer.cancel()
+        try:
+            mission_subscriber.close()
+        except Exception:
+            logger.exception("internal mission subscriber cleanup failed")
         try:
             runtime.close()
         finally:

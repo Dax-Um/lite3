@@ -119,7 +119,7 @@ def test_only_fresh_detected_forward_moves_on_x_axis():
     assert sink.commands[-1] == (1.00, 0.0, 0.0)
 
 
-def test_visible_center_status_auto_arms_without_search_event():
+def test_visible_center_status_is_ignored_without_search_event():
     sink = FakeMotionSink()
     controller = CoyoteMotionController(
         sink,
@@ -130,12 +130,12 @@ def test_visible_center_status_auto_arms_without_search_event():
 
     controller.handle_status(status_payload())
 
-    assert sink.acquires == 1
-    assert controller.tick() == (1.00, 0.0, 0.0)
-    assert controller.last_reason == "forward"
+    assert sink.acquires == 0
+    assert controller.tick() == (0.0, 0.0, 0.0)
+    assert controller.last_reason == "no_status"
 
 
-def test_visible_side_status_auto_arms_and_aligns_without_search_event():
+def test_visible_side_status_is_ignored_without_search_event():
     sink = FakeMotionSink()
     controller = CoyoteMotionController(
         sink,
@@ -146,12 +146,12 @@ def test_visible_side_status_auto_arms_and_aligns_without_search_event():
 
     controller.handle_status(status_payload(motion="stop", side="right"))
 
-    assert sink.acquires == 1
-    assert controller.tick() == (0.0, 0.0, -0.60)
-    assert controller.last_reason == "align_right"
+    assert sink.acquires == 0
+    assert controller.tick() == (0.0, 0.0, 0.0)
+    assert controller.last_reason == "no_status"
 
 
-def test_operator_stop_blocks_status_auto_arm_until_reset():
+def test_operator_stop_does_not_allow_status_to_acquire_motion():
     sink = FakeMotionSink()
     controller = CoyoteMotionController(
         sink,
@@ -168,11 +168,11 @@ def test_operator_stop_blocks_status_auto_arm_until_reset():
 
     controller.handle_patrol_command(PatrolAction.RESET, 1001)
     controller.handle_status(status_payload())
-    assert sink.acquires == 1
-    assert controller.tick() == (1.00, 0.0, 0.0)
+    assert sink.acquires == 0
+    assert controller.tick() == (0.0, 0.0, 0.0)
 
 
-def test_already_visible_center_goes_forward_without_search_turn():
+def test_fresh_visible_center_after_trigger_goes_forward_without_search_turn():
     sink = FakeMotionSink()
     controller = CoyoteMotionController(
         sink,
@@ -180,15 +180,14 @@ def test_already_visible_center_goes_forward_without_search_turn():
         monotonic_clock=lambda: 10.0,
     )
     prime_sensors(controller)
-    controller.handle_status(status_payload())
-
     controller.start_search("already-visible-center")
+    controller.handle_status(status_payload())
 
     assert controller.tick() == (1.00, 0.0, 0.0)
     assert controller.last_reason == "forward"
 
 
-def test_already_visible_side_aligns_without_blind_search_turn():
+def test_fresh_visible_side_after_trigger_aligns_without_blind_search_turn():
     sink = FakeMotionSink()
     controller = CoyoteMotionController(
         sink,
@@ -196,9 +195,8 @@ def test_already_visible_side_aligns_without_blind_search_turn():
         monotonic_clock=lambda: 10.0,
     )
     prime_sensors(controller)
-    controller.handle_status(status_payload(motion="stop", side="left"))
-
     controller.start_search("already-visible-left")
+    controller.handle_status(status_payload(motion="stop", side="left"))
 
     assert controller.tick() == (0.0, 0.0, 0.60)
     assert controller.last_reason == "align_left"
@@ -293,7 +291,7 @@ def test_not_detected_does_not_search_until_an_event_arms_it():
     )
 
     assert controller.tick() == (0.0, 0.0, 0.0)
-    assert controller.last_reason == "not_detected"
+    assert controller.last_reason == "no_status"
 
 
 def test_initial_event_searches_clockwise_and_deduplicates_event_id():
@@ -390,7 +388,7 @@ def test_nav_motion_before_search_ownership_does_not_consume_scan_budget():
     assert controller.last_reason == "search_clockwise"
 
 
-def test_search_advances_exactly_half_meter_then_scans_again():
+def test_search_advances_exactly_one_meter_then_scans_again():
     monotonic = [10.0]
     sink = FakeMotionSink()
     controller = CoyoteMotionController(
@@ -414,14 +412,14 @@ def test_search_advances_exactly_half_meter_then_scans_again():
 
     heading = -0.21
     controller.update_odom(
-        0.49 * math.cos(heading),
-        0.49 * math.sin(heading),
+        0.99 * math.cos(heading),
+        0.99 * math.sin(heading),
         heading,
     )
     assert controller.tick() == (0.05, 0.0, 0.0)
     controller.update_odom(
-        0.50 * math.cos(heading),
-        0.50 * math.sin(heading),
+        1.00 * math.cos(heading),
+        1.00 * math.sin(heading),
         heading,
     )
     assert controller.tick() == (0.0, 0.0, 0.0)
@@ -457,13 +455,17 @@ def test_search_advance_stops_if_motion_drifts_sideways():
     assert sink.releases >= 1
 
 
-def test_search_never_advances_a_second_time_for_same_event():
+def test_search_advances_once_then_completes_not_found():
+    completions = []
     sink = FakeMotionSink()
     controller = CoyoteMotionController(
         sink,
         search_sweep_rad=0.20,
         wall_clock=lambda: 100.0,
         monotonic_clock=lambda: 10.0,
+        on_coyote_complete=lambda event_id, reason: completions.append(
+            (event_id, reason)
+        ),
     )
     prime_sensors(controller)
     controller.handle_status(
@@ -476,8 +478,8 @@ def test_search_never_advances_a_second_time_for_same_event():
     controller.tick()
     heading = -0.21
     endpoint = (
-        0.50 * math.cos(heading),
-        0.50 * math.sin(heading),
+        1.00 * math.cos(heading),
+        1.00 * math.sin(heading),
     )
     controller.update_odom(endpoint[0], endpoint[1], heading)
     controller.tick()
@@ -485,7 +487,8 @@ def test_search_never_advances_a_second_time_for_same_event():
     controller.update_odom(endpoint[0], endpoint[1], -0.42)
 
     assert controller.tick() == (0.0, 0.0, 0.0)
-    assert controller.last_reason == "search_exhausted"
+    assert controller.last_reason == "search_not_found"
+    assert completions == [("event-4", "NOT_FOUND")]
     assert sink.releases >= 1
 
 
@@ -528,7 +531,7 @@ def test_detected_forward_and_side_alignment_require_fresh_odom():
     assert controller.last_reason == "odom_stale"
 
 
-def test_stuck_fresh_odom_trips_motion_progress_watchdog():
+def test_stuck_fresh_odom_pauses_then_keeps_search_armed():
     wall = [100.0]
     monotonic = [10.0]
     sink = FakeMotionSink()
@@ -558,8 +561,34 @@ def test_stuck_fresh_odom_trips_motion_progress_watchdog():
         command = controller.tick()
 
     assert command == (0.0, 0.0, 0.0)
-    assert controller.last_reason == "motion_progress_timeout"
-    assert sink.releases >= 1
+    assert controller.last_reason == "search_progress_wait"
+    assert sink.releases == 0
+
+    wall[0] += 0.01
+    monotonic[0] += 0.01
+    controller.update_scan(*scan())
+    controller.update_odom(0.0, 0.0, -0.04)
+    assert controller.tick() == (0.0, 0.0, -1.35)
+
+
+def test_search_waits_when_both_turn_directions_are_blocked_then_resumes():
+    sink = FakeMotionSink()
+    controller = CoyoteMotionController(
+        sink,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+    prime_sensors(controller, left=0.20, right=0.20)
+    controller.start_search("blocked-turn-event")
+
+    assert controller.tick() == (0.0, 0.0, 0.0)
+    assert controller.last_reason == "search_reverse"
+    assert controller.tick() == (0.0, 0.0, 0.0)
+    assert controller.last_reason == "search_turn_blocked"
+
+    controller.update_scan(*scan(left=2.0, right=0.20))
+    assert controller.tick() == (0.0, 0.0, 1.35)
+    assert controller.last_reason == "search_counterclockwise"
 
 
 def test_alignment_has_an_absolute_phase_deadline_even_with_progress():
@@ -768,11 +797,10 @@ class FakePublisher:
         )
 
 
-def test_spool_reader_publishes_image_then_video_once(tmp_path):
+def test_spool_reader_publishes_image_once(tmp_path):
     spool = CoyoteMediaSpool(CoyoteSpoolConfig(tmp_path), clock_ms=lambda: 1000)
     event_id = spool.new_event_id()
     spool.write_image(event_id, JPEG)
-    spool.write_video(event_id, MP4, duration_ms=5000)
     reader = CoyoteSpoolReader(tmp_path)
     publisher = FakePublisher()
 
@@ -780,23 +808,17 @@ def test_spool_reader_publishes_image_then_video_once(tmp_path):
     assert image is not None and image.kind == "image"
     reader.publish(image, publisher)
     reader.complete(image)
-    video = reader.claim_next()
-    assert video is not None and video.kind == "video"
-    reader.publish(video, publisher)
-    reader.complete(video)
 
-    assert [call[0] for call in publisher.calls] == ["image", "video"]
+    assert [call[0] for call in publisher.calls] == ["image"]
     assert {call[2] for call in publisher.calls} == {event_id}
     assert publisher.calls[0][1] is DetectionType.COYOTE
-    assert publisher.calls[1][-1] == 5000
     assert reader.claim_next() is None
 
 
-def test_generation_failure_publishes_fail_then_allows_video(tmp_path):
+def test_generation_failure_publishes_fail_image(tmp_path):
     spool = CoyoteMediaSpool(CoyoteSpoolConfig(tmp_path), clock_ms=lambda: 1000)
     event_id = spool.new_event_id()
     spool.write_failure(event_id, "image", reason="jpeg failed")
-    spool.write_video(event_id, MP4, duration_ms=5000)
     reader = CoyoteSpoolReader(tmp_path)
     publisher = FakePublisher()
 
@@ -804,7 +826,6 @@ def test_generation_failure_publishes_fail_then_allows_video(tmp_path):
     assert image is not None and image.kind == "image"
     reader.publish(image, publisher)
     reader.complete(image)
-    video = reader.claim_next()
 
     assert publisher.calls[0] == (
         "image",
@@ -812,7 +833,7 @@ def test_generation_failure_publishes_fail_then_allows_video(tmp_path):
         event_id,
         None,
     )
-    assert video is not None and video.kind == "video"
+    assert reader.claim_next() is None
 
 
 def test_malformed_status_is_forwarded_once_for_immediate_fail_close(tmp_path):

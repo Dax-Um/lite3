@@ -38,8 +38,114 @@ def test_bridge_defaults_to_no_robot_motion_and_20hz():
     assert args.motion_output == "disabled"
     assert args.control_hz >= 20.0
     assert args.status_timeout_sec <= 1.0
-    assert args.turn_speed_radps == pytest.approx(0.60)
-    assert args.search_turn_speed_radps == pytest.approx(1.35)
+    assert args.forward_speed_mps == pytest.approx(1.50)
+    assert args.turn_speed_radps == pytest.approx(0.65)
+    assert args.search_turn_speed_radps == pytest.approx(1.45)
+
+
+def test_target_reached_completion_uses_direct_turn_hello_then_navigation():
+    script = load_script()
+    calls = []
+    finished = []
+
+    class FakeDriver:
+        def send_cmd_vel(self, vx, vy, wz):
+            calls.append(("cmd_vel", vx, vy, wz))
+
+        def send_simple_command(self, code, value=0):
+            calls.append(("simple", code, value))
+
+    routine = script.CompletionActionRoutine(
+        FakeDriver(),
+        on_finished=finished.append,
+        logger=script.logging.getLogger("test-completion-action"),
+        sleep=lambda _seconds: None,
+        wait_for_robot_basic_state=lambda _state, _timeout: True,
+        direct_turn_steps=1,
+    )
+    routine._run("coyote-action-event")
+
+    assert calls == [
+        ("simple", script.CMD_MANUAL_MODE, 0),
+        ("simple", script.CMD_FLAT_GAIT_FAST, 0),
+        ("cmd_vel", 0.0, 0.0, 0.0),
+        ("cmd_vel", 0.0, 0.0, 0.0),
+        ("simple", script.CMD_FLAT_GAIT_SLOW, 0),
+        ("simple", script.CMD_NAVIGATION_MODE, 0),
+        ("cmd_vel", 0.0, 0.0, script.COMPLETION_DIRECT_TURN_WZ_RADPS),
+        ("simple", script.CMD_MANUAL_MODE, 0),
+        ("simple", script.CMD_STAND_SIT, 0),
+        ("simple", script.CMD_HELLO, 0),
+        ("simple", script.CMD_STAND_SIT, 0),
+        ("simple", script.CMD_NAVIGATION_MODE, 0),
+    ]
+    assert finished == ["coyote-action-event"]
+
+
+def test_gated_udp_motion_sink_stops_udp_after_release_until_next_search():
+    script = load_script()
+    calls = []
+
+    class FakeDriver:
+        def send_cmd_vel(self, vx, vy, wz):
+            calls.append((vx, vy, wz))
+
+    sink = script.GatedUdpMotionSink(FakeDriver())
+    sink.send_cmd_vel(0.0, 0.0, 0.0)
+    sink.acquire()
+    sink.send_cmd_vel(1.5, 0.0, 0.0)
+    sink.send_cmd_vel(0.0, 0.0, 0.0)
+    sink.release()
+    sink.send_cmd_vel(0.0, 0.0, 0.0)
+
+    assert calls == [(1.5, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    assert sink.wait_released(0.0)
+
+
+def test_coyote_mission_stands_before_search_and_sits_after_home():
+    script = load_script()
+    calls = []
+    ready = []
+
+    class FakeDriver:
+        def send_cmd_vel(self, vx, vy, wz):
+            calls.append(("cmd_vel", vx, vy, wz))
+
+        def send_simple_command(self, code, value=0):
+            calls.append(("simple", code, value))
+
+    routine = script.CoyoteMissionStartRoutine(
+        FakeDriver(),
+        on_search_ready=ready.append,
+        logger=script.logging.getLogger("test-mission-start"),
+        sleep=lambda _seconds: None,
+    )
+    routine.update_robot_basic_state(script.ROBOT_BASIC_STATE_SITTING)
+    routine._active_event_id = "mission-event"
+    # The fake driver cannot change Motion Host state, so emulate it after
+    # the Stand/Sit command as the real ROS RobotState stream does.
+    original_send = routine.driver.send_simple_command
+    def send_simple_command(code, value=0):
+        original_send(code, value)
+        if code == script.CMD_STAND_SIT:
+            next_state = (
+                script.ROBOT_BASIC_STATE_STANDING
+                if routine._robot_basic_state == script.ROBOT_BASIC_STATE_SITTING
+                else script.ROBOT_BASIC_STATE_SITTING
+            )
+            routine.update_robot_basic_state(next_state)
+    routine.driver.send_simple_command = send_simple_command
+    routine._run("mission-event")
+    routine.sit_after_home("mission-event")
+
+    assert calls == [
+        ("cmd_vel", 0.0, 0.0, 0.0),
+        ("simple", script.CMD_STAND_SIT, 0),
+        ("simple", script.CMD_NAVIGATION_MODE, 0),
+        ("simple", script.CMD_MANUAL_MODE, 0),
+        ("simple", script.CMD_STAND_SIT, 0),
+    ]
+    assert ready == ["mission-event"]
 
 
 def test_bridge_uses_the_same_container_mqtt_environment(monkeypatch):

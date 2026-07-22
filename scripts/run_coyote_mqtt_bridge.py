@@ -10,6 +10,7 @@ import math
 import os
 import queue
 import signal
+import socket
 import sys
 import threading
 import time
@@ -261,6 +262,9 @@ LONG_JUMP_START_TIMEOUT_SEC = 2.00
 LONG_JUMP_POST_ACTION_SETTLE_SEC = 2.00
 MISSION_STAND_SETTLE_SEC = 2.50
 MISSION_POSTURE_STATE_TIMEOUT_SEC = 5.00
+# Search-start gait preparation is kept separate from completion choreography.
+MISSION_FAST_GAIT_MANUAL_SETTLE_SEC = 0.50
+MISSION_FAST_GAIT_NAVIGATION_SETTLE_SEC = 0.50
 MISSION_HOME_SIT_TTS_DELAY_SEC = 0.00
 ROBOT_BASIC_STATE_SITTING = 1
 ROBOT_BASIC_STATE_PREPARING = 4
@@ -603,6 +607,56 @@ class CompletionActionRoutine:
                 with self._lock:
                     self._active_event_ids.discard(event_id)
 
+class MissionLedUdpClient:
+    """Send coyote mission LED state to the Motion Host's dedicated relay."""
+
+    HEARTBEAT_SEC = 1.0
+
+    def __init__(self, host: str, port: int, *, logger: logging.Logger) -> None:
+        self._destination = (host, int(port))
+        self._logger = logger
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._lock = threading.Lock()
+        self._active_event_id: Optional[str] = None
+        self._last_heartbeat_at = 0.0
+
+    def activate(self, event_id: str) -> None:
+        with self._lock:
+            self._active_event_id = event_id
+            self._send_locked("MISSION_ACTIVE", event_id)
+
+    def heartbeat(self) -> None:
+        with self._lock:
+            if self._active_event_id is None:
+                return
+            if time.monotonic() - self._last_heartbeat_at < self.HEARTBEAT_SEC:
+                return
+            self._send_locked("MISSION_ACTIVE", self._active_event_id)
+
+    def deactivate(self, event_id: str, *, state: str = "MISSION_COMPLETE") -> None:
+        with self._lock:
+            if self._active_event_id != event_id:
+                return
+            self._send_locked(state, event_id)
+            self._active_event_id = None
+
+    def close(self) -> None:
+        self._socket.close()
+
+    def _send_locked(self, state: str, event_id: str) -> None:
+        payload = json.dumps(
+            {"source": "iq9_coyote", "state": state, "event_id": event_id},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            self._socket.sendto(payload, self._destination)
+            self._last_heartbeat_at = time.monotonic()
+        except OSError:
+            self._logger.exception(
+                "coyote LED UDP send failed state=%s event_id=%s", state, event_id
+            )
+
+
 class RobotMotionStateTracker:
     """Wait for documented Motion Host action states from direct Robot State."""
 
@@ -717,11 +771,15 @@ class CoyoteMissionStartRoutine:
         on_search_ready: Callable[[str], None],
         logger: logging.Logger,
         sleep: Callable[[float], None] = time.sleep,
+        on_mission_accepted: Callable[[str], None] = lambda _event_id: None,
+        on_mission_failed: Callable[[str], None] = lambda _event_id: None,
     ) -> None:
         self.driver = driver
         self.on_search_ready = on_search_ready
         self.logger = logger
         self.sleep = sleep
+        self.on_mission_accepted = on_mission_accepted
+        self.on_mission_failed = on_mission_failed
         self._lock = threading.Condition()
         self._active_event_id = None
         self._stand_toggle_event_id = None
@@ -775,6 +833,8 @@ class CoyoteMissionStartRoutine:
                 )
                 return False
             self._active_event_id = event_id
+        # The red LED starts when this mission is accepted, before Stand/TTS.
+        self.on_mission_accepted(event_id)
         thread = threading.Thread(
             target=self._run,
             args=(event_id, before_stand),
@@ -829,6 +889,17 @@ class CoyoteMissionStartRoutine:
                 if self._stand_toggle_event_id == event_id:
                     self._stand_toggle_event_id = None
 
+    def _prepare_fast_search_gait(self, event_id: str) -> None:
+        """Select Fast gait before Navigation-mode target tracking begins."""
+        self.driver.send_simple_command(CMD_MANUAL_MODE)
+        self.logger.info("coyote mission Manual mode requested event_id=%s", event_id)
+        self.sleep(MISSION_FAST_GAIT_MANUAL_SETTLE_SEC)
+        self.driver.send_simple_command(CMD_FLAT_GAIT_FAST)
+        self.logger.info("coyote mission Fast gait requested event_id=%s", event_id)
+        self.sleep(MISSION_FAST_GAIT_NAVIGATION_SETTLE_SEC)
+        self.driver.send_simple_command(CMD_NAVIGATION_MODE)
+        self.logger.info("coyote mission Navigation mode requested event_id=%s", event_id)
+
     def _run(self, event_id: str, before_stand: Optional[Callable[[], None]]) -> None:
         try:
             self.driver.send_cmd_vel(0.0, 0.0, 0.0)
@@ -876,11 +947,13 @@ class CoyoteMissionStartRoutine:
             if state != ROBOT_BASIC_STATE_STANDING:
                 raise RuntimeError("timed out waiting for robot standing state")
             self.logger.info("coyote mission Stand confirmed event_id=%s", event_id)
-            # Motion Host applies velocity UDP commands only in navigation mode.
-            self.driver.send_simple_command(CMD_NAVIGATION_MODE)
+            # Motion ownership is not acquired until Fast gait and Navigation
+            # mode are both settled, so no tracking UDP packet races this setup.
+            self._prepare_fast_search_gait(event_id)
             self.on_search_ready(event_id)
         except Exception:
             self.logger.exception("coyote mission start failed event_id=%s", event_id)
+            self.on_mission_failed(event_id)
             with self._lock:
                 if self._active_event_id == event_id:
                     self._active_event_id = None
@@ -1043,6 +1116,12 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger = logging.getLogger("lite3-coyote-bridge")
+    network = load_lite3_network_config(ROOT)
+    mission_led = MissionLedUdpClient(
+        network.motion_host_ip,
+        network.motion_host_led_port,
+        logger=logger,
+    )
 
     driver = None
     direct_motion_sink = None
@@ -1424,6 +1503,10 @@ def main(argv=None) -> int:
             completion_driver,
             on_search_ready=capture_then_enqueue_search,
             logger=logger,
+            on_mission_accepted=mission_led.activate,
+            on_mission_failed=lambda event_id: mission_led.deactivate(
+                event_id, state="MISSION_ABORTED"
+            ),
         )
         if args.motion_output == "udp":
             driver = Lite3UdpDriver(
@@ -1521,7 +1604,8 @@ def main(argv=None) -> int:
             handoff_return_home(event_id)
 
         def publish_coyote_complete(event_id: str, completion_reason: str) -> None:
-            """Publish COMPLETE on ROS; the subscriber starts completion motion."""
+            """Deactivate LED, then publish COMPLETE on ROS."""
+            mission_led.deactivate(event_id)
             if bridge_node is None:
                 raise RuntimeError("coyote ROS bridge is not ready")
             bridge_node.publish_coyote_complete_event(event_id, completion_reason)
@@ -1598,8 +1682,10 @@ def main(argv=None) -> int:
             args.motion_output,
         )
         while rclpy.ok() and not stop.is_set():
+            mission_led.heartbeat()
             executor.spin_once(timeout_sec=0.1)
     finally:
+        mission_led.close()
         if timer is not None:
             timer.cancel()
         if completion_actions is not None:

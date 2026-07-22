@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, Optional, Protocol, Set, Tuple, Union
 
 from lite3_mqtt.contract import DetectionType, PatrolAction, decode_object
+from lite3_motion.target_tracking import TargetTrackingPolicy
 from lite3_motion.local_avoidance import (
     AvoidanceConfig,
     ClearanceSnapshot,
@@ -25,11 +26,17 @@ from lite3_perception.coyote_spool import validate_event_id
 
 
 COYOTE_STATUS_TIMEOUT_SEC = 1.0
-COYOTE_FORWARD_SPEED_MPS = 1.50
+# Target pursuit profile. Keep these separate from search and obstacle
+# avoidance values so a tracking-speed change never changes safety behavior.
+COYOTE_FORWARD_SPEED_MPS = 2.00
 COYOTE_SEARCH_ADVANCE_SPEED_MPS = 0.50
 COYOTE_CONTROL_HZ = 20.0
-COYOTE_TURN_SPEED_RADPS = 0.65  # Detected target alignment.
-COYOTE_SEARCH_TURN_SPEED_RADPS = 1.45  # Search only.
+COYOTE_TURN_SPEED_RADPS = 1.45  # Target left/right alignment toward center.
+COYOTE_SEARCH_TURN_SPEED_RADPS = 1.45  # Search/reacquisition only.
+# High target-alignment speed with small, feedback-friendly corrections.
+# Kept separate from the existing search/avoidance turn cadence.
+COYOTE_TARGET_ALIGN_TURN_STEP_SEC = 0.12
+COYOTE_TARGET_ALIGN_TURN_PAUSE_SEC = 0.05
 COYOTE_TURN_STEP_SEC = 0.25
 COYOTE_TURN_PAUSE_SEC = 0.10
 COYOTE_SEARCH_SWEEP_RAD = 2.0 * math.pi
@@ -121,6 +128,8 @@ class CoyoteMotionController:
         search_turn_speed_radps: float = COYOTE_SEARCH_TURN_SPEED_RADPS,
         turn_step_sec: float = COYOTE_TURN_STEP_SEC,
         turn_pause_sec: float = COYOTE_TURN_PAUSE_SEC,
+        target_align_turn_step_sec: float = COYOTE_TARGET_ALIGN_TURN_STEP_SEC,
+        target_align_turn_pause_sec: float = COYOTE_TARGET_ALIGN_TURN_PAUSE_SEC,
         search_sweep_rad: float = COYOTE_SEARCH_SWEEP_RAD,
         search_advance_m: float = COYOTE_SEARCH_ADVANCE_M,
         search_advance_speed_mps: float = COYOTE_SEARCH_ADVANCE_SPEED_MPS,
@@ -158,7 +167,13 @@ class CoyoteMotionController:
             raise ValueError(
                 "search_turn_speed_radps must be finite and positive"
             )
-        if min(turn_step_sec, turn_pause_sec, search_sweep_rad) <= 0.0:
+        if min(
+            turn_step_sec,
+            turn_pause_sec,
+            target_align_turn_step_sec,
+            target_align_turn_pause_sec,
+            search_sweep_rad,
+        ) <= 0.0:
             raise ValueError("turn timing and search sweep must be positive")
         if not math.isfinite(search_advance_m) or search_advance_m <= 0.0:
             raise ValueError("search_advance_m must be finite and positive")
@@ -190,6 +205,8 @@ class CoyoteMotionController:
         self.search_turn_speed_radps = search_turn_speed_radps
         self.turn_step_sec = turn_step_sec
         self.turn_pause_sec = turn_pause_sec
+        self.target_align_turn_step_sec = target_align_turn_step_sec
+        self.target_align_turn_pause_sec = target_align_turn_pause_sec
         self.search_sweep_rad = search_sweep_rad
         self.search_advance_m = search_advance_m
         self.search_advance_speed_mps = search_advance_speed_mps
@@ -207,6 +224,13 @@ class CoyoteMotionController:
         self.advance_lateral_tolerance_m = advance_lateral_tolerance_m
         self.advance_yaw_tolerance_rad = advance_yaw_tolerance_rad
         self.require_scan = bool(require_scan)
+        self.target_tracking_policy = TargetTrackingPolicy()
+        self._reacquire_anchor = None
+        self._target_reacquire_requested = False
+        self._reacquire_observe_until = 0.0
+        self._reacquire_sweep_commanded_rad = 0.0
+        self._reacquire_sweep_limit_rad = math.pi / 2.0
+        self._last_reacquired_observation_id = 0
         self.local_avoidance_policy = local_avoidance_policy or LocalAvoidancePolicy(
             AvoidanceConfig(
                 hard_stop_m=0.32,
@@ -254,6 +278,7 @@ class CoyoteMotionController:
         self._search_phase = "idle"
         self._search_direction = -1
         self._sweep_angle_rad = 0.0
+        self._sweep_commanded_rad = 0.0
         self._last_sweep_yaw = None  # type: Optional[float]
         self._search_turn_active = False
         self._advance_start_xy = None  # type: Optional[Tuple[float, float]]
@@ -337,6 +362,12 @@ class CoyoteMotionController:
             self._status_type = detection_type
             self._synthetic_search_status = False
             self._received_at = now_monotonic
+            self.target_tracking_policy.observe(
+                detect=status.detect,
+                side=status.side,
+                pose=((self._odom_xy[0], self._odom_xy[1], self._odom_yaw) if self._odom_xy is not None and self._odom_yaw is not None else None),
+                now=now_monotonic,
+            )
             self._last_reason = reason
             # A stop advisory is applied in this callback. Turning, if any,
             # starts on a later control tick so a zero command always separates
@@ -403,6 +434,12 @@ class CoyoteMotionController:
             else:
                 self._synthetic_search_status = False
             self._advance_completed = False
+            self.target_tracking_policy.clear()
+            self._last_reacquired_observation_id = 0
+            self._reacquire_anchor = None
+            self._target_reacquire_requested = False
+            self._reacquire_observe_until = 0.0
+            self._reacquire_sweep_commanded_rad = 0.0
             self._begin_scan_locked(direction=-1, phase="primary_turn")
             self._last_reason = "search_triggered"
             self._send_stop()
@@ -665,8 +702,9 @@ class CoyoteMotionController:
                 and now_monotonic - self._search_started_at
                 > self.search_session_timeout_sec
             ):
-                command, reason = self._abort_motion_locked(
-                    "search_session_timeout"
+                command, reason = self._complete_active_detection_locked(
+                    outcome="NOT_FOUND",
+                    reason="search_session_timeout",
                 )
             elif reason in {"forward", "motion_stop"} and not self._search_armed:
                 command = (0.0, 0.0, 0.0)
@@ -721,6 +759,7 @@ class CoyoteMotionController:
                 and 0.0 <= now_monotonic - self._scan_received_at
                 <= self.sensor_timeout_sec
             ):
+                base_reason = reason
                 override = self.local_avoidance_policy.arbitrate(
                     command,
                     self._clearance_snapshot,
@@ -729,6 +768,20 @@ class CoyoteMotionController:
                 if override is not None:
                     command = (override.vx, override.vy, override.wz)
                     reason = override.reason
+                    if (
+                        base_reason in {"forward", "align_left", "align_right"}
+                        and reason in {
+                            "obstacle_avoid_left", "obstacle_avoid_right",
+                            "obstacle_turn_left", "obstacle_turn_right",
+                            "obstacle_bypass_left", "obstacle_bypass_right",
+                        }
+                        and self.target_tracking_policy.preferred_search_direction(
+                            now=now_monotonic
+                        ) is not None
+                    ):
+                        # A target pursuit was diverted. On loss, return to the
+                        # last observation and face the target before scanning.
+                        self._target_reacquire_requested = True
                     # The PointCloud policy may reverse the scan direction to
                     # an open side.  Count the yaw in the direction actually
                     # commanded, otherwise a blocked clockwise scan never
@@ -793,6 +846,12 @@ class CoyoteMotionController:
         self._search_started_at = None
         self._active_detection_type = None
         self._active_event_id = None
+        self._reacquire_anchor = None
+        self._target_reacquire_requested = False
+        self._reacquire_observe_until = 0.0
+        self._reacquire_sweep_commanded_rad = 0.0
+        self._last_reacquired_observation_id = 0
+        self.target_tracking_policy.clear()
         self._external_action_hold = False
         self._search_phase = "idle"
         self._search_turn_active = False
@@ -847,6 +906,8 @@ class CoyoteMotionController:
             direction,
             now,
             speed_radps=self.turn_speed_radps,
+            step_sec=self.target_align_turn_step_sec,
+            pause_sec=self.target_align_turn_pause_sec,
         )
         return command, "align_left" if direction > 0 else "align_right"
 
@@ -854,16 +915,85 @@ class CoyoteMotionController:
         self,
         now: float,
     ) -> Tuple[Tuple[float, float, float], str]:
-        if not self._scan_fresh_locked(now):
-            return (0.0, 0.0, 0.0), "lidar_stale"
         if not self._odom_fresh_locked(now):
             return (0.0, 0.0, 0.0), "odom_stale"
+        # A normal target pursuit keeps the scan phase armed.  Therefore this
+        # check must happen before the primary-turn branch, otherwise a detour
+        # would fall straight back into a generic 360-degree scan.
+        if self._search_phase not in {
+            "reacquire_anchor", "reacquire_observe", "reacquire_sweep"
+        }:
+            # Every visible target status replaces the anchor. When that target
+            # is lost, the newest unconsumed observation wins over generic
+            # search regardless of whether a LiDAR detour happened.
+            self._target_reacquire_requested = False
+            anchor = self.target_tracking_policy.reacquire_anchor(
+                pose=(self._odom_xy[0], self._odom_xy[1], self._odom_yaw),
+                now=now,
+                allow_near=True,
+            )
+            if (
+                anchor is not None
+                and anchor.observation_id > self._last_reacquired_observation_id
+            ):
+                self._last_reacquired_observation_id = anchor.observation_id
+                self._reacquire_anchor = anchor
+                self._search_phase = "reacquire_anchor"
+                return self._reacquire_anchor_command_locked()
+        if self._search_phase == "wait_reposition_scan":
+            if not self._scan_fresh_locked(now):
+                return (0.0, 0.0, 0.0), "search_wait_lidar"
+            return self._begin_reposition_locked()
+        if self._search_phase not in {"primary_turn", "secondary_turn"} and not self._scan_fresh_locked(now):
+            return (0.0, 0.0, 0.0), "lidar_stale"
         if self._search_phase == "reposition_turn":
             return self._reposition_turn_command_locked()
+        if self._search_phase == "reacquire_anchor":
+            return self._reacquire_anchor_command_locked()
+        if self._search_phase == "reacquire_observe":
+            if now < self._reacquire_observe_until:
+                return (0.0, 0.0, 0.0), "reacquire_observe"
+            # Do not immediately lose the remembered bearing to a 360-degree
+            # scan. First inspect only that target-side sector, then leave for
+            # the next open local search point if RGB still has no target.
+            direction = self._reacquire_anchor.direction if self._reacquire_anchor else -1
+            self._reacquire_anchor = None
+            self._search_phase = "reacquire_sweep"
+            self._search_direction = 1 if direction > 0 else -1
+            self._reacquire_sweep_commanded_rad = 0.0
+            self._search_turn_active = False
+            self._reset_pulse_locked()
+        if self._search_phase == "reacquire_sweep":
+            if not self._turn_clear_locked(self._search_direction):
+                self._search_phase = "wait_reposition_scan"
+                self._search_turn_active = False
+                self._reset_pulse_locked()
+                return (0.0, 0.0, 0.0), "reacquire_sector_blocked"
+            if self._reacquire_sweep_commanded_rad >= self._reacquire_sweep_limit_rad:
+                self._search_phase = "wait_reposition_scan"
+                self._search_turn_active = False
+                self._reset_pulse_locked()
+                return (0.0, 0.0, 0.0), "reacquire_sector_complete"
+            was_turning = self._search_turn_active
+            command = self._pulse_turn_locked(
+                self._search_direction,
+                now,
+                speed_radps=self.search_turn_speed_radps,
+            )
+            self._search_turn_active = command[2] != 0.0
+            if self._search_turn_active and not was_turning:
+                self._reacquire_sweep_commanded_rad += (
+                    self.search_turn_speed_radps * self.turn_step_sec
+                )
+            return command, (
+                "reacquire_sweep_left"
+                if self._search_direction > 0 else "reacquire_sweep_right"
+            )
         if self._search_phase == "advance":
             return self._advance_command_locked()
         if self._search_phase not in {"primary_turn", "secondary_turn"}:
-            self._begin_scan_locked(direction=-1, phase="primary_turn")
+            preferred_direction = self.target_tracking_policy.preferred_search_direction(now=now)
+            self._begin_scan_locked(direction=preferred_direction or -1, phase="primary_turn")
 
         direction = self._search_direction
         if not self._turn_clear_locked(direction):
@@ -877,12 +1007,16 @@ class CoyoteMotionController:
             self._reset_pulse_locked()
             return (0.0, 0.0, 0.0), "search_turn_blocked"
 
-        if self._sweep_angle_rad >= self.search_sweep_rad:
-            if self._advance_completed:
-                return self._complete_active_detection_locked(
-                    outcome="NOT_FOUND",
-                    reason="search_not_found",
-                )
+        if self._sweep_commanded_rad >= self.search_sweep_rad:
+            # Every successful 1 m leg creates a new local search point.
+            # Continue from that point until the bounded session expires; only
+            # then complete NOT_FOUND and use the existing direct home return.
+            self._advance_completed = False
+            self._search_phase = "wait_reposition_scan"
+            self._search_turn_active = False
+            self._reset_pulse_locked()
+            if not self._scan_fresh_locked(now):
+                return (0.0, 0.0, 0.0), "search_wait_lidar"
             return self._begin_reposition_locked()
 
         was_turning = self._search_turn_active
@@ -893,8 +1027,33 @@ class CoyoteMotionController:
         )
         self._search_turn_active = command[2] != 0.0
         if self._search_turn_active and not was_turning:
+            self._sweep_commanded_rad += self.search_turn_speed_radps * self.turn_step_sec
             self._last_sweep_yaw = self._odom_yaw
         return command, "search_clockwise" if direction < 0 else "search_counterclockwise"
+
+    def _reacquire_anchor_command_locked(self) -> Tuple[Tuple[float, float, float], str]:
+        """Return to the last robot pose that still had a target observation."""
+        anchor = self._reacquire_anchor
+        if anchor is None or self._odom_xy is None or self._odom_yaw is None:
+            return (0.0, 0.0, 0.0), "odom_stale"
+        dx = anchor.x - self._odom_xy[0]
+        dy = anchor.y - self._odom_xy[1]
+        distance = math.hypot(dx, dy)
+        desired_yaw = anchor.target_yaw if distance <= 0.15 else math.atan2(dy, dx)
+        yaw_error = _normalize_angle(desired_yaw - self._odom_yaw)
+        if abs(yaw_error) > self.advance_yaw_tolerance_rad:
+            return (0.0, 0.0, math.copysign(self.search_turn_speed_radps, yaw_error)), "reacquire_turn"
+        if distance <= 0.15:
+            # Give RGB one short, stationary observation window after facing
+            # the remembered target bearing. Only a fresh miss starts a scan.
+            self._search_phase = "reacquire_observe"
+            self._reacquire_observe_until = self.monotonic_clock() + 0.40
+            return (0.0, 0.0, 0.0), "reacquire_ready"
+        if not self._front_clear_locked():
+            self._reacquire_anchor = None
+            self._begin_scan_locked(direction=anchor.direction or -1, phase="primary_turn")
+            return (0.0, 0.0, 0.0), "reacquire_blocked"
+        return (self.search_advance_speed_mps, 0.0, 0.0), "reacquire_drive"
 
     def _advance_command_locked(self) -> Tuple[Tuple[float, float, float], str]:
         if self._odom_xy is None:
@@ -972,6 +1131,7 @@ class CoyoteMotionController:
         self._search_phase = phase
         self._search_direction = 1 if direction > 0 else -1
         self._sweep_angle_rad = 0.0
+        self._sweep_commanded_rad = 0.0
         self._last_sweep_yaw = self._odom_yaw
         self._search_turn_active = False
         self._advance_start_xy = None
@@ -985,6 +1145,8 @@ class CoyoteMotionController:
         now: float,
         *,
         speed_radps: float,
+        step_sec: Optional[float] = None,
+        pause_sec: Optional[float] = None,
     ) -> Tuple[float, float, float]:
         direction = 1 if direction > 0 else -1
         if direction != self._pulse_direction:
@@ -994,8 +1156,10 @@ class CoyoteMotionController:
             return (0.0, 0.0, direction * speed_radps)
         if now < self._pulse_pause_until:
             return (0.0, 0.0, 0.0)
-        self._pulse_active_until = now + self.turn_step_sec
-        self._pulse_pause_until = self._pulse_active_until + self.turn_pause_sec
+        active_sec = self.turn_step_sec if step_sec is None else step_sec
+        inactive_sec = self.turn_pause_sec if pause_sec is None else pause_sec
+        self._pulse_active_until = now + active_sec
+        self._pulse_pause_until = self._pulse_active_until + inactive_sec
         return (0.0, 0.0, direction * speed_radps)
 
     def _reset_pulse_locked(self) -> None:
@@ -1064,6 +1228,16 @@ class CoyoteMotionController:
             return ("search_advance", 0)
         if reason == "search_reposition_turn":
             return ("search_turn", 0)
+        if reason == "reacquire_turn":
+            return ("search_turn", 0)
+        if reason == "reacquire_drive":
+            return ("search_advance", 0)
+        if reason == "reacquire_sweep_left":
+            return ("search_turn", 1)
+        if reason == "reacquire_sweep_right":
+            return ("search_turn", -1)
+        if reason == "obstacle_slow":
+            return ("track_forward", 0)
         if reason == "forward":
             return ("track_forward", 0)
         if reason in {"obstacle_avoid_left", "obstacle_turn_left"}:
@@ -1082,6 +1256,12 @@ class CoyoteMotionController:
         self._search_started_at = None
         self._active_detection_type = None
         self._active_event_id = None
+        self._reacquire_anchor = None
+        self._target_reacquire_requested = False
+        self._reacquire_observe_until = 0.0
+        self._reacquire_sweep_commanded_rad = 0.0
+        self._last_reacquired_observation_id = 0
+        self.target_tracking_policy.clear()
         self._search_phase = "idle"
         self._search_turn_active = False
         self._reset_pulse_locked()
@@ -1186,6 +1366,12 @@ class CoyoteMotionController:
         self._search_started_at = None
         self._active_detection_type = None
         self._active_event_id = None
+        self._reacquire_anchor = None
+        self._target_reacquire_requested = False
+        self._reacquire_observe_until = 0.0
+        self._reacquire_sweep_commanded_rad = 0.0
+        self._last_reacquired_observation_id = 0
+        self.target_tracking_policy.clear()
         self._search_phase = "idle"
         self._search_turn_active = False
         self._reset_pulse_locked()

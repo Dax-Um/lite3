@@ -23,16 +23,18 @@ class ClearanceSnapshot:
 class AvoidanceConfig:
     # Deliberately compact clearances: body envelope plus a small braking
     # margin, not a map/navigation inflation radius.
-    hard_stop_m: float = 0.32
-    forward_clearance_m: float = 0.50
-    turn_clearance_m: float = 0.32
+    hard_stop_m: float = 0.40
+    forward_clearance_m: float = 0.65
+    slow_clearance_m: float = 1.50
+    slow_speed_mps: float = 0.40
+    turn_clearance_m: float = 0.40
     avoid_turn_wz_radps: float = 0.85
     # Do not hand control back after a tiny turn.  First face a clearly open
     # corridor, then drive straight through that corridor before RGB target
     # alignment can turn the body back toward the obstacle.
-    resume_clearance_m: float = 0.65
+    resume_clearance_m: float = 0.90
     min_turn_sec: float = 1.35
-    bypass_speed_mps: float = 0.50
+    bypass_speed_mps: float = 0.40
     bypass_sec: float = 1.00
 
 
@@ -51,6 +53,8 @@ class LocalAvoidancePolicy:
         if min(
             config.hard_stop_m,
             config.forward_clearance_m,
+            config.slow_clearance_m,
+            config.slow_speed_mps,
             config.turn_clearance_m,
             config.avoid_turn_wz_radps,
             config.resume_clearance_m,
@@ -61,6 +65,8 @@ class LocalAvoidancePolicy:
             raise ValueError("avoidance config values must be positive")
         if config.hard_stop_m > config.forward_clearance_m:
             raise ValueError("hard_stop_m must not exceed forward_clearance_m")
+        if config.slow_clearance_m < config.forward_clearance_m:
+            raise ValueError("slow_clearance_m must not be below forward_clearance_m")
         if config.resume_clearance_m < config.forward_clearance_m:
             raise ValueError("resume_clearance_m must not be below forward_clearance_m")
         self.config = config
@@ -100,10 +106,16 @@ class LocalAvoidancePolicy:
             return active
         if vx > 0.0:
             front = snapshot.front_m
-            if front is None or front >= self.config.forward_clearance_m:
+            if front is None or front >= self.config.slow_clearance_m:
                 return None
+            if front >= self.config.forward_clearance_m:
+                return AvoidanceDecision(
+                    min(vx, self.config.slow_speed_mps), 0.0, 0.0, "obstacle_slow"
+                )
             if target_matched:
                 return AvoidanceDecision(0.0, 0.0, 0.0, "target_proximity_hold")
+            if front <= self.config.hard_stop_m:
+                return AvoidanceDecision(0.0, 0.0, 0.0, "obstacle_hard_stop")
             direction = self._open_turn_direction(snapshot)
             if direction is None:
                 reason = "obstacle_hard_stop" if front <= self.config.hard_stop_m else "obstacle_no_turn_clearance"
@@ -133,6 +145,9 @@ class LocalAvoidancePolicy:
         if self._phase == "idle":
             return None
         direction = self._direction
+        if snapshot.front_m is not None and snapshot.front_m <= self.config.hard_stop_m:
+            self.reset()
+            return AvoidanceDecision(0.0, 0.0, 0.0, "obstacle_hard_stop")
         if direction is None:
             self.reset()
             return None

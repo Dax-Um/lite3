@@ -19,6 +19,7 @@ SAFETY_LIMITS_CONFIG_PATH = Path("configs/lite3/safety_limits.yaml")
 class Lite3NetworkConfig:
     motion_host_ip: str
     motion_host_command_port: int
+    motion_host_led_port: int
     iq9_management_ip: str
     iq9_robot_side_ip: str
     iq9_robot_side_interface: str = "end0"
@@ -34,6 +35,7 @@ def load_lite3_network_config(workspace_root: str | Path) -> Lite3NetworkConfig:
     return Lite3NetworkConfig(
         motion_host_ip=str(lite3["motion_host_ip"]),
         motion_host_command_port=int(lite3["motion_host_command_port"]),
+        motion_host_led_port=int(lite3.get("motion_host_led_port", 43901)),
         iq9_management_ip=str(lite3["iq9_management_ip"]),
         iq9_robot_side_ip=str(lite3["iq9_robot_side_ip"]),
         iq9_robot_side_interface=str(lite3.get("iq9_robot_side_interface", "end0")),

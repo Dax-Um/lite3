@@ -7,6 +7,8 @@ lite3:
   iq9_robot_side_note: "사용자가 IQ9 end0에 고정 IP로 설정한 robot-side 유선 IP"
   motion_host_ip: "192.168.1.120"
   motion_host_command_port: 43893
+  # Dedicated UDP relay on Motion Host; never shares the motion command port.
+  motion_host_led_port: 43901
   current_state_destination_ip: "192.168.1.103"
   state_destination_port: 43897
   motion_host_local_port: 43893

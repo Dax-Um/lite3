@@ -28,7 +28,12 @@ class DirectReturnConfig:
     turn_min_wz_radps: float = 0.08
     control_period_sec: float = 0.05
     turn_timeout_sec: float = 12.0
-    drive_timeout_sec: float = 20.0
+    # A 3x4 m demo can require several avoidance detours. This is a hard
+    # ceiling, not the normal stop condition; live position progress below
+    # detects a genuine stall much sooner.
+    drive_timeout_sec: float = 60.0
+    drive_progress_timeout_sec: float = 12.0
+    drive_progress_distance_m: float = 0.10
     distance_tolerance_m: float = 0.015
     # Brake into the saved direct Motion Host home coordinate instead of
     # retaining the demo's 1.5 m/s speed until the final control tick.
@@ -61,7 +66,7 @@ class DirectReturnExecutor:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        if min(config.forward_speed_mps, config.turn_speed_radps, config.yaw_tolerance_rad, config.turn_heading_kp, config.turn_min_wz_radps, config.control_period_sec, config.turn_timeout_sec, config.drive_timeout_sec, config.distance_tolerance_m, config.arrival_slowdown_distance_m, config.arrival_speed_kp, config.arrival_min_speed_mps, config.drive_heading_kp, config.drive_max_wz_radps, config.clearance_timeout_sec) <= 0:
+        if min(config.forward_speed_mps, config.turn_speed_radps, config.yaw_tolerance_rad, config.turn_heading_kp, config.turn_min_wz_radps, config.control_period_sec, config.turn_timeout_sec, config.drive_timeout_sec, config.drive_progress_timeout_sec, config.drive_progress_distance_m, config.distance_tolerance_m, config.arrival_slowdown_distance_m, config.arrival_speed_kp, config.arrival_min_speed_mps, config.drive_heading_kp, config.drive_max_wz_radps, config.clearance_timeout_sec) <= 0:
             raise ValueError("direct return config values must be positive")
         self.driver = driver
         self.yaw_provider = yaw_provider
@@ -150,11 +155,15 @@ class DirectReturnExecutor:
         if not all(math.isfinite(value) for value in target_position):
             raise ValueError("direct home position must be finite")
 
-        deadline = self.monotonic() + self.config.drive_timeout_sec
+        started_at = self.monotonic()
+        deadline = started_at + self.config.drive_timeout_sec
+        last_progress_at = started_at
+        last_progress_position = None
         try:
             while True:
-                if self.monotonic() >= deadline:
-                    raise TimeoutError("direct return-to-position timed out")
+                now = self.monotonic()
+                if now >= deadline:
+                    raise TimeoutError("direct return-to-position hard timeout")
                 current_position = self.position_provider()
                 if current_position is None or not all(
                     math.isfinite(value) for value in current_position
@@ -165,6 +174,14 @@ class DirectReturnExecutor:
                 remaining = math.hypot(dx, dy)
                 if remaining <= self.config.distance_tolerance_m:
                     return current_position, remaining
+                if last_progress_position is None or math.hypot(
+                    current_position[0] - last_progress_position[0],
+                    current_position[1] - last_progress_position[1],
+                ) >= self.config.drive_progress_distance_m:
+                    last_progress_position = current_position
+                    last_progress_at = now
+                elif now - last_progress_at >= self.config.drive_progress_timeout_sec:
+                    raise TimeoutError("direct return-to-position stalled")
 
                 yaw = self.yaw_provider()
                 if yaw is None or not math.isfinite(yaw):

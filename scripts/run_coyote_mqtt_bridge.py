@@ -78,7 +78,7 @@ DEFAULT_REALSENSE_REQUEST_DIR = "/home/ubuntu/iq9_coyote/outputs/realsense_reque
 DEFAULT_AUDIO_REQUEST_DIR = "/home/ubuntu/iq9_coyote/audio_requests"
 BARK_HEIGHT_RATIO = 0.15
 TTS_MISSION_STARTED = "Coyote search mission started."
-TTS_MISSION_COMPLETE = "Coyote has been deterred. Returning home."
+TTS_MISSION_COMPLETE = "I've successfully deterred the coyote. I'm heading home."
 TTS_HOME_ARRIVED = "Mission complete. I am home."
 # Demo default: Long Jump is mechanically non-deterministic on this setup.
 # Keep its implementation available, but never enter it from the coyote flow.
@@ -1520,17 +1520,45 @@ def main(argv=None) -> int:
             motion_sink = motion_output_node
         else:
             motion_sink = DisabledMotionSink()
+        complete_publish_lock = threading.Lock()
+        complete_published_event_ids = set()
+
+        def publish_coyote_complete_mqtt(event_id: str, completion_reason: str) -> None:
+            """Publish each external COMPLETE event once, after its required cue."""
+            with complete_publish_lock:
+                if event_id in complete_published_event_ids:
+                    logger.warning(
+                        "duplicate coyote COMPLETE suppressed event_id=%s reason=%s",
+                        event_id,
+                        completion_reason,
+                    )
+                    return
+                complete_published_event_ids.add(event_id)
+            payload = build_coyote_complete_payload(
+                event_id=event_id,
+                completion_reason=completion_reason,
+            )
+            media_client.publish_json(Topics.COYOTE_COMPLETE, payload)
+            logger.info(
+                "coyote COMPLETE published topic=%s event_id=%s reason=%s",
+                Topics.COYOTE_COMPLETE,
+                event_id,
+                completion_reason,
+            )
+
         def speak_deterrence_after_slow(event_id: str) -> None:
-            """Play only a prepared WAV after Fast/Slow has finished."""
+            """Finish the deterrence cue before publishing external COMPLETE."""
             try:
                 audio_cue.play_prepared_and_wait(event_id, "mission-complete")
             except Exception:
-                # Audio failure must not strand the completed robot before
-                # the existing turn and direct return-home sequence.
+                # Audio failure must not strand the completed robot or suppress
+                # its terminal MQTT event.
                 logger.exception(
                     "coyote deterrence TTS failed; completion continues event_id=%s",
                     event_id,
                 )
+            finally:
+                publish_coyote_complete_mqtt(event_id, "TARGET_REACHED")
 
         completion_actions = CompletionActionRoutine(
             completion_driver,
@@ -1554,22 +1582,20 @@ def main(argv=None) -> int:
         def handle_coyote_complete_event(event_id: str, completion_reason: str) -> None:
             audio_cue.complete(event_id)
             if completion_reason == "TARGET_REACHED":
-                audio_cue.prepare_tts(
-                    event_id,
-                    "mission-complete",
-                    TTS_MISSION_COMPLETE,
-                )
-            payload = build_coyote_complete_payload(
-                event_id=event_id,
-                completion_reason=completion_reason,
-            )
-            media_client.publish_json(Topics.COYOTE_COMPLETE, payload)
-            logger.info(
-                "coyote COMPLETE published topic=%s event_id=%s reason=%s",
-                Topics.COYOTE_COMPLETE,
-                event_id,
-                completion_reason,
-            )
+                try:
+                    audio_cue.prepare_tts(
+                        event_id,
+                        "mission-complete",
+                        TTS_MISSION_COMPLETE,
+                    )
+                except Exception:
+                    # The later playback step logs the missing prepared cue,
+                    # then still emits the terminal MQTT event.
+                    logger.exception(
+                        "coyote deterrence TTS preparation failed; "
+                        "completion continues event_id=%s",
+                        event_id,
+                    )
             if completion_reason == "TARGET_REACHED":
                 if completion_actions is None:
                     raise RuntimeError("coyote completion action routine is not ready")
@@ -1601,6 +1627,7 @@ def main(argv=None) -> int:
                 return
             # A completed search with no target has no gesture; return home
             # immediately while preserving the same internal mission handoff.
+            publish_coyote_complete_mqtt(event_id, completion_reason)
             handoff_return_home(event_id)
 
         def publish_coyote_complete(event_id: str, completion_reason: str) -> None:

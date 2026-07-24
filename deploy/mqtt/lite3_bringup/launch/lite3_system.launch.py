@@ -36,6 +36,7 @@ def generate_launch_description():
     broker_port = LaunchConfiguration("broker_port")
     spool_dir = LaunchConfiguration("coyote_spool_dir")
     nav_network_interface = LaunchConfiguration("nav_network_interface")
+    voice_runtime_dir = LaunchConfiguration("voice_runtime_dir")
 
     motion_state_receiver = ExecuteProcess(
         name="lite3_motion_state_receiver",
@@ -48,6 +49,8 @@ def generate_launch_description():
             "0.0.0.0",
             "--port",
             "43897",
+            "--state-file",
+            PathJoinSubstitution([voice_runtime_dir, "motion_state.json"]),
         ],
         cwd=workspace_root,
         output="screen",
@@ -120,6 +123,10 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "nav_network_interface",
                 default_value="end0",
+            ),
+            DeclareLaunchArgument(
+                "voice_runtime_dir",
+                default_value="/home/ubuntu/iq9_coyote/outputs/voice_control",
             ),
             SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp"),
             SetEnvironmentVariable("ROS_LOCALHOST_ONLY", "1"),

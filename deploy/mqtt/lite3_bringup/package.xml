@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lite3_bringup</name>
+  <version>0.1.0</version>
+  <description>Single-container ROS 2 Foxy bringup for the Lite3 runtime.</description>
+  <maintainer email="robotics@example.com">Lite3 Robotics</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

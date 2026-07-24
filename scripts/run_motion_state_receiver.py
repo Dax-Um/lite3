@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,6 +31,7 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=43897)
     parser.add_argument("--stale-after-sec", type=float, default=0.30)
     parser.add_argument("--log-interval-sec", type=float, default=2.0)
+    parser.add_argument("--state-file", type=Path, help="Atomically publish the newest state for host-side safety controllers.")
     return parser.parse_args(argv)
 
 
@@ -55,6 +57,15 @@ def _state_payload(state):
             state.vel_body_yaw_radps,
         ],
     }
+
+
+def write_state_file(path: Path, payload: dict) -> None:
+    """Replace the state snapshot atomically; readers never see partial JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = {**payload, "written_at_unix": time.time()}
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(snapshot, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def main(argv=None):
@@ -115,6 +126,8 @@ def main(argv=None):
             runtime["packets"] += 1
             runtime["last_state_at"] = state.received_at_monotonic
             payload = _state_payload(state)
+            if args.state_file is not None:
+                write_state_file(args.state_file, payload)
             message = String()
             message.data = json.dumps(payload, separators=(",", ":"))
             state_pub.publish(message)
